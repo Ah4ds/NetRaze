@@ -1,4 +1,5 @@
 mod ftp;
+pub mod kerberos;
 pub mod ldap;
 mod mssql;
 mod nfs;
@@ -47,6 +48,7 @@ pub fn builtin_protocols() -> Vec<Box<dyn ProtocolFactory>> {
     vec![
         Box::new(smb::factory()),
         Box::new(ldap::factory()),
+        Box::new(kerberos::factory()),
         Box::new(ssh::factory()),
         Box::new(winrm::factory()),
         Box::new(rdp::factory()),
