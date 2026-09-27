@@ -161,7 +161,12 @@ pub fn show_right_panel(ctx: &egui::Context, state: &mut AppState, runtime: &Run
             ..Default::default()
         })
         .show(ctx, |ui| {
-            config_panel::show(ui, state, runtime);
+            egui::ScrollArea::vertical()
+                .id_salt("right_panel_scroll")
+                .auto_shrink([false; 2])
+                .show(ui, |ui| {
+                    config_panel::show(ui, state, runtime);
+                });
         });
 }
 
