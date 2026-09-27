@@ -2,8 +2,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub mod directory;
+pub mod kerberos;
 
 pub use directory::*;
+pub use kerberos::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Capability {

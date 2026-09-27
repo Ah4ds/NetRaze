@@ -41,6 +41,8 @@ pub fn builtin_modules() -> Vec<Box<dyn ModuleFactory>> {
         Box::new(active_directory::adcs::factory()),
         Box::new(active_directory::add_computer::factory()),
         Box::new(active_directory::coerce_plus::factory()),
+        Box::new(active_directory::asreproast::factory()),
+        Box::new(active_directory::kerberoast::factory()),
         Box::new(credentials::aws_credentials::factory()),
         Box::new(credentials::dpapi_hash::factory()),
         Box::new(reconnaissance::enum_av::factory()),

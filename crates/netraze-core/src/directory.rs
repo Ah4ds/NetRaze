@@ -88,6 +88,8 @@ pub struct DirectoryUser {
     pub password_never_expires: bool,
     pub password_not_required: bool,
     pub trusted_for_delegation: bool,
+    #[serde(default)]
+    pub does_not_require_preauth: bool,
     pub last_logon_timestamp: Option<String>,
     pub password_last_set: Option<String>,
     pub when_created: Option<String>,

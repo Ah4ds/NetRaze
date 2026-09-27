@@ -149,11 +149,11 @@ pub struct TicketGrantingTicket {
     pub(crate) ticket: Ticket,
     pub(crate) session_key: Vec<u8>,
     pub(crate) session_encryption_type: KerberosEncryptionType,
-    client_principal: String,
-    realm: String,
-    valid_from_unix: i64,
-    valid_until_unix: i64,
-    renewable_until_unix: Option<i64>,
+    pub(crate) client_principal: String,
+    pub(crate) realm: String,
+    pub(crate) valid_from_unix: i64,
+    pub(crate) valid_until_unix: i64,
+    pub(crate) renewable_until_unix: Option<i64>,
 }
 
 impl core::fmt::Debug for TicketGrantingTicket {
@@ -205,8 +205,8 @@ impl TicketGrantingTicket {
 /// Kerberos client bound to one KDC endpoint and realm.
 #[derive(Debug, Clone)]
 pub struct KerberosClient {
-    config: KerberosClientConfig,
-    transport: KdcTransport,
+    pub(crate) config: KerberosClientConfig,
+    pub(crate) transport: KdcTransport,
 }
 
 impl KerberosClient {
@@ -306,12 +306,12 @@ impl KerberosClient {
     }
 }
 
-enum AsExchangeReply {
+pub(crate) enum AsExchangeReply {
     AsRep(AsRep),
     Error(KrbError),
 }
 
-fn decode_kdc_reply(bytes: &[u8]) -> Result<AsExchangeReply, KerberosError> {
+pub(crate) fn decode_kdc_reply(bytes: &[u8]) -> Result<AsExchangeReply, KerberosError> {
     validate_der_envelope(bytes)?;
     match bytes[0] {
         AS_REP_TAG => picky_asn1_der::from_bytes(bytes)
@@ -327,7 +327,7 @@ fn decode_kdc_reply(bytes: &[u8]) -> Result<AsExchangeReply, KerberosError> {
     }
 }
 
-fn validate_der_envelope(bytes: &[u8]) -> Result<(), KerberosError> {
+pub(crate) fn validate_der_envelope(bytes: &[u8]) -> Result<(), KerberosError> {
     if bytes.len() < 2 {
         return Err(KerberosError::InvalidMessage(
             "DER reply is truncated".to_owned(),
@@ -373,7 +373,7 @@ fn validate_der_envelope(bytes: &[u8]) -> Result<(), KerberosError> {
     Ok(())
 }
 
-fn build_as_req(
+pub(crate) fn build_as_req(
     realm: &str,
     username: &str,
     nonce: u32,
@@ -603,7 +603,9 @@ fn finish_as_exchange(
     })
 }
 
-fn encrypted_data_type(data: &EncryptedData) -> Result<KerberosEncryptionType, KerberosError> {
+pub(crate) fn encrypted_data_type(
+    data: &EncryptedData,
+) -> Result<KerberosEncryptionType, KerberosError> {
     let number = integer_as_i32(&data.etype.0).ok_or_else(|| {
         KerberosError::InvalidMessage("invalid encrypted-data enctype".to_owned())
     })?;
@@ -616,7 +618,7 @@ fn date_to_unix(value: GeneralizedTimeAsn1) -> Result<i64, KerberosError> {
         .map_err(|error| KerberosError::InvalidMessage(error.to_string()))
 }
 
-fn kdc_error(error: KrbError) -> KerberosError {
+pub(crate) fn kdc_error(error: KrbError) -> KerberosError {
     let message = error
         .0
         .e_text
@@ -631,7 +633,10 @@ fn kdc_error(error: KrbError) -> KerberosError {
     }
 }
 
-fn principal(name_type: u8, components: &[&str]) -> Result<PrincipalName, KerberosError> {
+pub(crate) fn principal(
+    name_type: u8,
+    components: &[&str],
+) -> Result<PrincipalName, KerberosError> {
     let components = components
         .iter()
         .map(|component| kerberos_string(component))
@@ -642,7 +647,7 @@ fn principal(name_type: u8, components: &[&str]) -> Result<PrincipalName, Kerber
     })
 }
 
-fn principal_name(value: &PrincipalName) -> String {
+pub(crate) fn principal_name(value: &PrincipalName) -> String {
     value
         .name_string
         .0
@@ -653,7 +658,7 @@ fn principal_name(value: &PrincipalName) -> String {
         .join("/")
 }
 
-fn kerberos_string(value: &str) -> Result<KerberosStringAsn1, KerberosError> {
+pub(crate) fn kerberos_string(value: &str) -> Result<KerberosStringAsn1, KerberosError> {
     IA5String::from_string(value.to_owned())
         .map(KerberosStringAsn1::from)
         .map_err(|error| KerberosError::InvalidMessage(error.to_string()))
@@ -663,7 +668,7 @@ fn default_salt(realm: &str, username: &str) -> String {
     format!("{realm}{username}")
 }
 
-fn integer_i32(value: i32) -> IntegerAsn1 {
+pub(crate) fn integer_i32(value: i32) -> IntegerAsn1 {
     let bytes = value.to_be_bytes();
     let first = bytes
         .iter()
@@ -678,7 +683,7 @@ fn integer_i32(value: i32) -> IntegerAsn1 {
     IntegerAsn1::from(output)
 }
 
-fn integer_u32(value: u32) -> IntegerAsn1 {
+pub(crate) fn integer_u32(value: u32) -> IntegerAsn1 {
     let bytes = value.to_be_bytes();
     let first = bytes
         .iter()
@@ -691,7 +696,7 @@ fn integer_u32(value: u32) -> IntegerAsn1 {
     IntegerAsn1::from(output)
 }
 
-fn integer_as_i32(value: &IntegerAsn1) -> Option<i32> {
+pub(crate) fn integer_as_i32(value: &IntegerAsn1) -> Option<i32> {
     if value.0.is_empty() || value.0.len() > 4 {
         return None;
     }
@@ -701,7 +706,7 @@ fn integer_as_i32(value: &IntegerAsn1) -> Option<i32> {
     Some(i32::from_be_bytes(bytes))
 }
 
-fn integer_as_u32(value: &IntegerAsn1) -> Option<u32> {
+pub(crate) fn integer_as_u32(value: &IntegerAsn1) -> Option<u32> {
     if value.0.is_empty() || value.0.len() > 5 || value.0[0] & 0x80 != 0 {
         return None;
     }
@@ -718,7 +723,7 @@ fn integer_as_u32(value: &IntegerAsn1) -> Option<u32> {
     Some(u32::from_be_bytes(bytes))
 }
 
-fn encode_der<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, KerberosError> {
+pub(crate) fn encode_der<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, KerberosError> {
     picky_asn1_der::to_vec(value).map_err(|error| KerberosError::InvalidMessage(error.to_string()))
 }
 
@@ -735,7 +740,7 @@ fn validate_realm(realm: &str) -> Result<(), KerberosError> {
     Ok(())
 }
 
-fn validate_username(username: &str) -> Result<(), KerberosError> {
+pub(crate) fn validate_username(username: &str) -> Result<(), KerberosError> {
     if username.is_empty()
         || username.len() > 256
         || !username.is_ascii()

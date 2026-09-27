@@ -15,6 +15,7 @@ const ACCOUNT_LOCKED: u32 = 0x0000_0010;
 const PASSWORD_NOT_REQUIRED: u32 = 0x0000_0020;
 const PASSWORD_NEVER_EXPIRES: u32 = 0x0001_0000;
 const TRUSTED_FOR_DELEGATION: u32 = 0x0008_0000;
+const DOES_NOT_REQUIRE_PREAUTH: u32 = 0x0040_0000;
 const TRUSTED_TO_AUTH_FOR_DELEGATION: u32 = 0x0100_0000;
 const MAX_GPO_LINKS: usize = 4_096;
 const MAX_GPO_LINK_LENGTH: usize = 1024 * 1024;
@@ -715,6 +716,7 @@ fn user_from_entry(entry: &LdapEntry) -> Option<DirectoryUser> {
         password_never_expires: flags & PASSWORD_NEVER_EXPIRES != 0,
         password_not_required: flags & PASSWORD_NOT_REQUIRED != 0,
         trusted_for_delegation: flags & TRUSTED_FOR_DELEGATION != 0,
+        does_not_require_preauth: flags & DOES_NOT_REQUIRE_PREAUTH != 0,
         last_logon_timestamp: text(entry, "lastLogonTimestamp"),
         password_last_set: text(entry, "pwdLastSet"),
         when_created: text(entry, "whenCreated"),
@@ -1056,7 +1058,7 @@ mod tests {
                 (
                     "userAccountControl".to_owned(),
                     vec![
-                        (ACCOUNT_DISABLED | PASSWORD_NEVER_EXPIRES)
+                        (ACCOUNT_DISABLED | PASSWORD_NEVER_EXPIRES | DOES_NOT_REQUIRE_PREAUTH)
                             .to_string()
                             .into_bytes(),
                     ],
@@ -1070,6 +1072,7 @@ mod tests {
         let user = user_from_entry(&entry).unwrap();
         assert!(user.disabled);
         assert!(user.password_never_expires);
+        assert!(user.does_not_require_preauth);
         assert_eq!(user.service_principal_names, ["HTTP/web.example.test"]);
     }
 
