@@ -21,7 +21,9 @@ use picky_krb::data_types::{
     EncryptedData, EtypeInfo2, KerbPaPacRequest, KerberosStringAsn1, PaData, PaEncTsEnc,
     PrincipalName, Ticket,
 };
-use picky_krb::messages::{AsRep, AsReq, EncAsRepPart, KdcReq, KdcReqBody, KrbError};
+use picky_krb::messages::{
+    AsRep, AsReq, EncAsRepPart, EncKdcRepPart, EncTgsRepPart, KdcReq, KdcReqBody, KrbError,
+};
 use rand::rngs::OsRng;
 use rand::{CryptoRng, Rng, RngCore};
 use time::OffsetDateTime;
@@ -545,27 +547,26 @@ fn finish_as_exchange(
         AS_REP_ENC,
         &as_rep.0.enc_part.0.cipher.0.0,
     )?;
-    let encrypted_part: EncAsRepPart = picky_asn1_der::from_bytes(&plaintext)
-        .map_err(|error| KerberosError::InvalidMessage(error.to_string()))?;
-    if integer_as_u32(&encrypted_part.0.nonce.0) != Some(nonce) {
+    let encrypted_part = decode_enc_kdc_rep_part(&plaintext)?;
+    if integer_as_u32(&encrypted_part.nonce.0) != Some(nonce) {
         return Err(KerberosError::InvalidMessage(
             "AS-REP nonce does not match request".to_owned(),
         ));
     }
-    let service_realm = encrypted_part.0.srealm.0.to_string();
+    let service_realm = encrypted_part.srealm.0.to_string();
     if !service_realm.eq_ignore_ascii_case(realm)
-        || principal_name(&encrypted_part.0.sname.0) != format!("krbtgt/{realm}")
+        || principal_name(&encrypted_part.sname.0) != format!("krbtgt/{realm}")
     {
         return Err(KerberosError::InvalidMessage(
             "AS-REP does not contain the requested krbtgt service".to_owned(),
         ));
     }
     let session_encryption_type = KerberosEncryptionType::from_number(
-        integer_as_i32(&encrypted_part.0.key.0.key_type.0).ok_or_else(|| {
+        integer_as_i32(&encrypted_part.key.0.key_type.0).ok_or_else(|| {
             KerberosError::InvalidMessage("invalid session-key enctype".to_owned())
         })?,
     )?;
-    let session_key = encrypted_part.0.key.0.key_value.0.0.clone();
+    let session_key = encrypted_part.key.0.key_value.0.0.clone();
     if session_key.len() != session_encryption_type.key_len() {
         return Err(KerberosError::InvalidKeyLength {
             encryption_type: session_encryption_type.name(),
@@ -573,19 +574,18 @@ fn finish_as_exchange(
             actual: session_key.len(),
         });
     }
-    let valid_from = encrypted_part.0.start_time.0.as_ref().map_or_else(
-        || encrypted_part.0.auth_time.0.clone(),
+    let valid_from = encrypted_part.start_time.0.as_ref().map_or_else(
+        || encrypted_part.auth_time.0.clone(),
         |value| value.0.clone(),
     );
     let valid_from_unix = date_to_unix(valid_from)?;
-    let valid_until_unix = date_to_unix(encrypted_part.0.end_time.0.clone())?;
+    let valid_until_unix = date_to_unix(encrypted_part.end_time.0.clone())?;
     if valid_until_unix <= valid_from_unix {
         return Err(KerberosError::InvalidMessage(
             "AS-REP ticket lifetime is invalid".to_owned(),
         ));
     }
     let renewable_until_unix = encrypted_part
-        .0
         .renew_till
         .0
         .as_ref()
@@ -601,6 +601,16 @@ fn finish_as_exchange(
         valid_until_unix,
         renewable_until_unix,
     })
+}
+
+/// Windows-compatible KDCs may encode an AS reply's encrypted body with the
+/// application-26 `EncTGSRepPart` wrapper even though RFC 4120 names
+/// application 25 for `EncASRepPart`. Both wrap the same `EncKDCRepPart`.
+pub(crate) fn decode_enc_kdc_rep_part(plaintext: &[u8]) -> Result<EncKdcRepPart, KerberosError> {
+    picky_asn1_der::from_bytes::<EncAsRepPart>(plaintext)
+        .map(|part| part.0)
+        .or_else(|_| picky_asn1_der::from_bytes::<EncTgsRepPart>(plaintext).map(|part| part.0))
+        .map_err(|error| KerberosError::InvalidMessage(error.to_string()))
 }
 
 pub(crate) fn encrypted_data_type(
@@ -875,6 +885,63 @@ mod tests {
         assert_eq!(tgt.valid_until_unix(), (now + TEN_HOURS).unix_timestamp());
     }
 
+    #[tokio::test]
+    async fn nt_hash_as_exchange_uses_rc4_without_a_password() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let nt_hash = [0x31_u8; 16];
+        let server = tokio::spawn(async move {
+            let (mut first_stream, first) = read_request(&listener).await;
+            let initial: AsReq = picky_asn1_der::from_bytes(&first).unwrap();
+            let nonce = integer_as_u32(&initial.0.req_body.0.nonce.0).unwrap();
+            let error = preauth_required_for(
+                "EXAMPLE.TEST",
+                "alice",
+                now,
+                KerberosEncryptionType::Rc4Hmac,
+            );
+            write_response(&mut first_stream, &error).await;
+
+            let (mut second_stream, second) = read_request(&listener).await;
+            let authenticated: AsReq = picky_asn1_der::from_bytes(&second).unwrap();
+            let pa_data = &authenticated.0.padata.0.as_ref().unwrap().0.0;
+            let timestamp: EncryptedData =
+                picky_asn1_der::from_bytes(&pa_data[0].padata_data.0.0).unwrap();
+            assert_eq!(integer_as_i32(&timestamp.etype.0), Some(23));
+            decrypt(
+                KerberosEncryptionType::Rc4Hmac,
+                &nt_hash,
+                1,
+                &timestamp.cipher.0.0,
+            )
+            .expect("NT-hash pre-auth timestamp was not valid RC4-HMAC");
+            let reply = successful_as_rep_with(
+                "EXAMPLE.TEST",
+                "alice",
+                nonce,
+                now,
+                KerberosEncryptionType::Rc4Hmac,
+                &nt_hash,
+            );
+            write_response(&mut second_stream, &reply).await;
+        });
+
+        let client =
+            KerberosClient::connect(KerberosClientConfig::new(endpoint, "example.test")).unwrap();
+        let mut rng = OsRng;
+        let tgt = client
+            .request_tgt_at("alice", &KerberosCredential::NtHash(nt_hash), now, &mut rng)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(tgt.client_principal(), "alice");
+        assert_eq!(
+            tgt.session_encryption_type(),
+            KerberosEncryptionType::Rc4Hmac
+        );
+    }
+
     async fn read_request(listener: &TcpListener) -> (tokio::net::TcpStream, Vec<u8>) {
         let (mut stream, _) = listener.accept().await.unwrap();
         let mut header = [0_u8; 4];
@@ -894,12 +961,27 @@ mod tests {
     }
 
     fn preauth_required(realm: &str, username: &str, now: OffsetDateTime) -> KrbError {
+        preauth_required_for(
+            realm,
+            username,
+            now,
+            KerberosEncryptionType::Aes256CtsHmacSha196,
+        )
+    }
+
+    fn preauth_required_for(
+        realm: &str,
+        username: &str,
+        now: OffsetDateTime,
+        encryption_type: KerberosEncryptionType,
+    ) -> KrbError {
         let salt = format!("{realm}{username}");
         let info = EtypeInfo2::from(vec![EtypeInfo2Entry {
-            etype: ExplicitContextTag0::from(integer_i32(18)),
-            salt: Optional::from(Some(ExplicitContextTag1::from(
-                kerberos_string(&salt).unwrap(),
-            ))),
+            etype: ExplicitContextTag0::from(integer_i32(encryption_type.number())),
+            salt: Optional::from(
+                (encryption_type != KerberosEncryptionType::Rc4Hmac)
+                    .then(|| ExplicitContextTag1::from(kerberos_string(&salt).unwrap())),
+            ),
             s2kparams: Optional::from(None),
         }]);
         let methods = Asn1SequenceOf::from(vec![PaData {
@@ -928,10 +1010,28 @@ mod tests {
     }
 
     fn successful_as_rep(realm: &str, username: &str, nonce: u32, now: OffsetDateTime) -> AsRep {
-        let session_key = vec![0x42; 32];
+        let encryption_type = KerberosEncryptionType::Aes256CtsHmacSha196;
+        let long_term_key = derive_password_key(
+            encryption_type,
+            "test-only-password",
+            format!("{realm}{username}").as_bytes(),
+        )
+        .unwrap();
+        successful_as_rep_with(realm, username, nonce, now, encryption_type, &long_term_key)
+    }
+
+    fn successful_as_rep_with(
+        realm: &str,
+        username: &str,
+        nonce: u32,
+        now: OffsetDateTime,
+        encryption_type: KerberosEncryptionType,
+        long_term_key: &[u8],
+    ) -> AsRep {
+        let session_key = vec![0x42; encryption_type.key_len()];
         let encrypted_part = EncAsRepPart::from(EncKdcRepPart {
             key: ExplicitContextTag0::from(EncryptionKey {
-                key_type: ExplicitContextTag0::from(integer_i32(18)),
+                key_type: ExplicitContextTag0::from(integer_i32(encryption_type.number())),
                 key_value: ExplicitContextTag1::from(OctetStringAsn1::from(session_key)),
             }),
             last_req: ExplicitContextTag1::from(LastReq::from(Vec::new())),
@@ -958,15 +1058,9 @@ mod tests {
             caadr: Optional::from(None),
             encrypted_pa_data: Optional::from(None),
         });
-        let long_term_key = derive_password_key(
-            KerberosEncryptionType::Aes256CtsHmacSha196,
-            "test-only-password",
-            format!("{realm}{username}").as_bytes(),
-        )
-        .unwrap();
         let encrypted = encrypt(
-            KerberosEncryptionType::Aes256CtsHmacSha196,
-            &long_term_key,
+            encryption_type,
+            long_term_key,
             AS_REP_ENC,
             &encode_der(&encrypted_part).unwrap(),
             &mut OsRng,
@@ -991,7 +1085,7 @@ mod tests {
                 }),
             })),
             enc_part: ExplicitContextTag6::from(EncryptedData {
-                etype: ExplicitContextTag0::from(integer_i32(18)),
+                etype: ExplicitContextTag0::from(integer_i32(encryption_type.number())),
                 kvno: Optional::from(None),
                 cipher: ExplicitContextTag2::from(OctetStringAsn1::from(encrypted)),
             }),

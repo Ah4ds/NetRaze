@@ -6,8 +6,8 @@
 //! assessment.
 
 use hmac::{Hmac, Mac};
-use md5::Md5;
-use picky_krb::crypto::CipherSuite;
+use md5::{Digest, Md5};
+use picky_krb::crypto::{ChecksumSuite, CipherSuite};
 use rand::{CryptoRng, RngCore};
 
 use super::KerberosError;
@@ -135,6 +135,43 @@ pub fn decrypt(
     }
 }
 
+/// Compute the keyed checksum carried by a TGS authenticator.
+///
+/// AES uses the RFC 3961 HMAC-SHA1-96 profiles. RC4 uses the RFC 4757
+/// `HMAC_MD5` checksum, whose signed checksum type is `-138` on the wire.
+pub(crate) fn keyed_checksum(
+    encryption_type: KerberosEncryptionType,
+    key: &[u8],
+    key_usage: i32,
+    payload: &[u8],
+) -> Result<(i32, Vec<u8>), KerberosError> {
+    validate_key(encryption_type, key)?;
+    match encryption_type {
+        KerberosEncryptionType::Aes256CtsHmacSha196 => Ok((
+            16,
+            ChecksumSuite::HmacSha196Aes256
+                .hasher()
+                .checksum(key, key_usage, payload)
+                .map_err(|error| KerberosError::Crypto(error.to_string()))?,
+        )),
+        KerberosEncryptionType::Aes128CtsHmacSha196 => Ok((
+            15,
+            ChecksumSuite::HmacSha196Aes128
+                .hasher()
+                .checksum(key, key_usage, payload)
+                .map_err(|error| KerberosError::Crypto(error.to_string()))?,
+        )),
+        KerberosEncryptionType::Rc4Hmac => {
+            let signing_key = hmac_md5(key, b"signaturekey\0")?;
+            let mut digest_input = Vec::with_capacity(4 + payload.len());
+            digest_input.extend_from_slice(&rc4_usage(key_usage).to_le_bytes());
+            digest_input.extend_from_slice(payload);
+            let digest = Md5::digest(&digest_input);
+            Ok((-138, hmac_md5(&signing_key, &digest)?.to_vec()))
+        }
+    }
+}
+
 fn validate_key(encryption_type: KerberosEncryptionType, key: &[u8]) -> Result<(), KerberosError> {
     let expected = encryption_type.key_len();
     if key.len() != expected {
@@ -246,7 +283,7 @@ mod tests {
 
     #[test]
     fn rc4_hmac_matches_impacket_known_answer() {
-        let key = hex("8846f7eaee8fb117ad06bdd830b7586c");
+        let key = (0_u8..16).collect::<Vec<_>>();
         let plaintext = b"NetRaze Kerberos RFC 4757";
         let mut rng = FixedRng(*b"12345678");
         let ciphertext = encrypt(
@@ -259,7 +296,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             to_hex(&ciphertext),
-            "037ce6bf87b28e8f14fc1fd7c274e433db27c961c3ff019ec55d7ccfd4ca3b0bd3249c2ef302e1f4ada03e97d36997be11"
+            "416fe2ba807a4ef1f25c0967ab9fe1f84b8fe3be8d563cff1958c7f4098544c6c73299ad00817fe889ef237f297c59875b"
         );
         assert_eq!(
             decrypt(KerberosEncryptionType::Rc4Hmac, &key, 1, &ciphertext).unwrap(),
@@ -287,10 +324,17 @@ mod tests {
     }
 
     #[test]
-    fn derives_rc4_key_as_nt_hash() {
-        let key =
-            derive_password_key(KerberosEncryptionType::Rc4Hmac, "password", b"ignored").unwrap();
-        assert_eq!(to_hex(&key), "8846f7eaee8fb117ad06bdd830b7586c");
+    fn rc4_keyed_checksum_matches_impacket_fixture() {
+        let key = (0_u8..16).collect::<Vec<_>>();
+        let (checksum_type, checksum) = keyed_checksum(
+            KerberosEncryptionType::Rc4Hmac,
+            &key,
+            6,
+            b"NetRaze TGS body fixture",
+        )
+        .unwrap();
+        assert_eq!(checksum_type, -138);
+        assert_eq!(to_hex(&checksum), "2eb4b8038f1046dbd9cb50628a502669");
     }
 
     #[test]
@@ -313,14 +357,6 @@ mod tests {
             to_hex(&aes256),
             "01b897121d933ab44b47eb5494db15e50eb74530dbdae9b634d65020ff5d88c1"
         );
-    }
-
-    fn hex(value: &str) -> Vec<u8> {
-        value
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|pair| u8::from_str_radix(core::str::from_utf8(pair).unwrap(), 16).unwrap())
-            .collect()
     }
 
     fn to_hex(value: &[u8]) -> String {

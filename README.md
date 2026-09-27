@@ -3,7 +3,7 @@
 [![Release](https://github.com/Ah4ds/NetRaze/actions/workflows/release.yml/badge.svg)](https://github.com/Ah4ds/NetRaze/actions/workflows/release.yml)
 [![License](https://img.shields.io/badge/license-BSD--2--Clause-blue)](#license)
 [![Rust Edition](https://img.shields.io/badge/rust-2024%20edition%20%28MSRV%201.85%29-orange)](rust-toolchain.toml)
-[![Status](https://img.shields.io/badge/status-alpha%20%E2%80%94%20SMB%20%2B%20LDAP-yellow)](#current-status)
+[![Status](https://img.shields.io/badge/status-alpha%20%E2%80%94%20SMB%20%2B%20LDAP%20%2B%20Kerberos-yellow)](#current-status)
 
 **NetRaze** is an offensive network-execution toolkit, rewritten from scratch
 in pure Rust. It is the spiritual successor to the NetExec / CrackMapExec
@@ -108,6 +108,7 @@ enumeration work in both modes.
 | Protocol | State |
 |---|---|
 | LDAP | Port 389; NTLMv2 SASL/SPNEGO sign-and-seal (password or NT hash), anonymous bind, RootDSE, paged read-only AD inventory (users, groups, computers, OUs, topology, privileged principals, SPNs, and reported security policy), plus BloodHound Community Edition schema-v6 JSON/ZIP export. |
+| Kerberos | TCP KDC transport; password, NT-hash, AES-128, and AES-256 TGT acquisition; LDAP-assisted or explicit AS-REP/service-SPN assessment; RC4/AES ticket processing; explicit Hashcat-compatible artifact export. |
 | WinRM, MSSQL, SSH, RDP, FTP, NFS, VNC, WMI | Scaffold only — factory registered, no wire code yet |
 
 ### DCE/RPC stack (`netraze-dcerpc`)
@@ -121,7 +122,8 @@ enumeration work in both modes.
 
 ### What's next
 
-- Kerberos / AES-based authentication (only NTLMv2 today).
+- Kerberos-backed SMB/LDAP session authentication, ticket import, and S4U
+  delegation flows. The AS/TGS assessment foundation is implemented.
 - SMB3 encryption (AES-CCM/GCM) — most targets still accept unencrypted
   SMB2.
 - LDAP follow-ups — ACL/security-descriptor collection and active checks for
@@ -141,7 +143,7 @@ logic**. Everything else flows from those two constraints.
 | `netraze-app` | Composition root. `NetRazeApp::bootstrap()` wires registries and services. |
 | `netraze-cli` | Thin CLI binary (`clap`). Maps arguments to use-cases. |
 | `netraze-desktop` | `egui`/`eframe` GUI with `egui-snarl` workflow graph and `egui_graphs` network view. |
-| `netraze-protocols` | Wire-level protocol handlers, including the implemented SMB and LDAP modules. |
+| `netraze-protocols` | Wire-level protocol handlers, including the implemented SMB, LDAP/NTLM, and Kerberos modules. |
 | `netraze-dcerpc` | MS-RPCE stack: NDR, PDU, NTLMSSP auth; SRVSVC, SAMR, WINREG, SCMR interfaces. |
 | `netraze-modules` | Post-exploitation modules organised by category (`active_directory`, `credentials`, `reconnaissance`). |
 | `netraze-auth` | Credential types and authentication methods. |
@@ -231,6 +233,28 @@ For pass-the-hash authentication, put the 32-character NT hash in an
 environment variable and replace `--password-env` with `--nt-hash-env`.
 The exporter writes loose BloodHound CE schema-v6 JSON files and a ZIP archive.
 
+Kerberos secrets also stay out of the command line. TGT validation does not
+save a ticket, and roast material is written only when `--output` is supplied:
+
+```shell
+export NETRAZE_KRB_PASSWORD='replace-with-an-authorized-test-password'
+cargo run -p netraze-cli -- kerberos tgt \
+  --kdc dc.example.test:88 --realm EXAMPLE.TEST --username alice \
+  --password-env NETRAZE_KRB_PASSWORD
+
+cargo run -p netraze-cli -- kerberos kerberoast \
+  --kdc dc.example.test:88 --realm EXAMPLE.TEST --username alice \
+  --password-env NETRAZE_KRB_PASSWORD \
+  --ldap-endpoint dc.example.test:389 --ldap-domain EXAMPLE \
+  --output ./kerberos-artifacts.txt
+unset NETRAZE_KRB_PASSWORD
+```
+
+`kerberos asrep-roast` accepts repeated `--user` values, a bounded
+`--users-file`, or LDAP discovery. Use `--nt-hash-env`, `--aes128-key-env`, or
+`--aes256-key-env` in place of `--password-env` for the corresponding TGT
+credential.
+
 ## Desktop GUI
 
 The GUI (`netraze-desktop`) is a node-graph workspace where each host,
@@ -261,6 +285,14 @@ error for that target, not a silent anonymous retry. LDAP anonymous bind
 has no SASL sign-and-seal; named LDAP credentials use NTLMv2 sign-and-seal.
 `Guest` with an empty password is an explicit NTLM attempt that the server
 may reject.
+
+For Kerberos scans, select **Kerberos** in Configuration, supply the realm and
+optionally a separate KDC endpoint, then choose AS-REP and/or service-SPN
+assessment. Targets can be entered explicitly or discovered from the current
+LDAP inventory. Password, NT hash, AES-128, and AES-256 credentials are
+supported; imported tickets are not. Result nodes persist only safe finding
+metadata. The sensitive artifact material remains in memory for the current
+session and is written only through **Export Hashcat material…**.
 
 LDAP discovery creates an **AD Directory** workflow node with Overview,
 Users, Groups, Computers, OUs, Topology, Privileged, Services, and Security
@@ -332,7 +364,7 @@ cargo fmt --all --check               # check formatting
 
 ```shell
 cargo test -p netraze-dcerpc         # NDR / PDU / NTLMSSP / interface suites
-cargo test -p netraze-protocols      # SMB, LDAP, NTLM, and dispatcher tests
+cargo test -p netraze-protocols      # SMB, LDAP/NTLM, Kerberos, and dispatcher tests
 ```
 
 ### CI / release
@@ -347,7 +379,7 @@ clippy / test gates locally before pushing — the strict clippy gate
 
 A wire-level toolkit is only as trustworthy as its test harness. Unit
 tests, pinned byte fixtures, and isolated live harnesses cover the
-implemented SMB/DCE-RPC and LDAP paths:
+implemented SMB/DCE-RPC, LDAP/NTLM, and Kerberos paths:
 
 1. **Known-answer vectors for crypto.** NTLMv2 response, NTOWFv2,
    SIGN/SEAL key derivation, and RC4 keystream are validated against
@@ -367,13 +399,16 @@ implemented SMB/DCE-RPC and LDAP paths:
    proving the wire is not just internally consistent but actually
    interoperable. SMB wire changes are cross-checked against Impacket
    against the same harness before they land.
-4. **Samba AD LDAP harness.** `tests/samba-ad/` runs a separate, digest-pinned
-   domain controller bound to loopback. Its ignored suite verifies NTLM
+4. **Samba AD LDAP/Kerberos harness.** `tests/samba-ad/` runs a separate,
+   digest-pinned domain controller and KDC bound to loopback. Its ignored suites verify NTLM
    password/hash bind, protected RootDSE search, paging, and complete
    read-only inventory. It also checks anonymous RootDSE access, rejection
    of wrong-password and Guest NTLM binds, protected searches with escaped
    filters and returned referrals, and a complete BloodHound CE schema-v6
-   JSON/ZIP export.
+   JSON/ZIP export. Kerberos coverage includes password/AES TGT acquisition,
+   wrong-password rejection, LDAP-discovered AS-REP and SPN candidates, and
+   end-to-end AS/TGS artifact collection. Deterministic unit and loopback tests
+   cover NT-hash/RC4 exchanges because the pinned KDC rejects RC4 by policy.
 
 See the [SMB harness guide](tests/samba/README.md) and
 [LDAP harness guide](tests/samba-ad/README.md) for local commands.
@@ -386,7 +421,7 @@ See the [SMB harness guide](tests/samba/README.md) and
 | Phase 1 | DCE/RPC primitives, NTLMSSP, SMB2 auth, SRVSVC, Samba harness | Done |
 | Phase 2 | SMB2 IOCTL / FSCTL_PIPE_TRANSCEIVE, SMB signing, SAM RemoteOperations, SQLite workspace, CLI execution path | Mostly done — pipe transport, signing and SAM remote ops landed; SQLite workspace and the CLI execution path remain |
 | Phase 3 | Deep per-protocol modules inside `netraze-protocols`, stable plugin API, JSON/CSV export, priority module parity with NetExec | Planned |
-| Phase 4 | Integration test corpus, network fixtures, TUI or machine-friendly API, Kerberos | Planned |
+| Phase 4 | Integration test corpus, network fixtures, TUI or machine-friendly API, Kerberos | In progress — Kerberos AS/TGS assessment and its Samba AD fixture are delivered |
 
 Full write-up in [`docs/migration-roadmap.md`](docs/migration-roadmap.md).
 
@@ -397,8 +432,9 @@ This is an early-stage port. The highest-leverage contributions right now:
 - **LDAP follow-ups** (`netraze-protocols::ldap`) — security-descriptor
   collection and explicitly tested policy probes; the read-only inventory
   already covers users, groups, computers, SPNs, and directory structure.
-- **Kerberos** (`netraze-protocols::kerberos`) — AS/TGS exchange, RC4/AES key
-  handling; the next big authentication milestone after NTLMv2.
+- **Kerberos follow-ups** (`netraze-protocols::kerberos`) — ticket-backed
+  SMB/LDAP authentication, ccache/kirbi import, and delegation flows; bounded
+  AS/TGS exchange and RC4/AES assessment are already delivered.
 - **Deep per-protocol modules** inside `netraze-protocols` as coverage grows.
 - **Impacket-pinned fixtures** for each new DCE/RPC interface added
   (see `crates/netraze-dcerpc/tests/gen_*.py` for the pattern).
@@ -408,8 +444,8 @@ Before opening a PR, please ensure:
 - `cargo fmt --all --check` passes.
 - `cargo clippy -p netraze-dcerpc -- -D warnings` passes.
 - `cargo test --workspace --no-fail-fast` passes on your OS. If you touched
-  SMB2/DCE-RPC, run the SMB Samba suite; if you touched LDAP or its NTLM
-  SASL path, run the separate Samba AD suite as well.
+  SMB2/DCE-RPC, run the SMB Samba suite; if you touched LDAP, its NTLM SASL
+  path, or Kerberos, run the separate Samba AD suites as well.
 
 ## Related projects
 

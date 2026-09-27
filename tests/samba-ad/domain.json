@@ -38,6 +38,16 @@
         "given_name": "Carol",
         "surname": "Danvers",
         "member_of": ["operators"]
+      },
+      {
+        "name": "asrep",
+        "given_name": "AS-REP",
+        "surname": "Fixture"
+      },
+      {
+        "name": "svc_http",
+        "given_name": "HTTP",
+        "surname": "Service"
       }
     ]
   }

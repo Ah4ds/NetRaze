@@ -45,10 +45,10 @@ porte **à la demande**, par module Rust ciblé, avec Impacket comme
 |---|---|---|---|
 | TCP transport (timeout, IPv4/IPv6) | `std::net` + `tokio::net` | ✅ | SMB utilise son transport existant ; LDAP est async avec délais et plafond de PDU |
 | TLS (rustls) | `rustls` | ⚪ | Requis pour LDAPS, RPC over HTTPS, WinRM. Out v1 |
-| ASN.1 / DER / BER | `rasn` + `rasn-ldap` dans `netraze-protocols::ldap` | ✅ | Modèle RFC 4511 maintenu par `rasn-ldap`; façade interne étroite |
+| ASN.1 / DER / BER | `rasn-ldap` pour LDAP ; `picky-asn1`/`picky-krb` pour Kerberos | ✅ | Façades internes étroites, enveloppes et allocations bornées |
 | NTLMSSP (NEGOTIATE/CHALLENGE/AUTHENTICATE + seal/sign) | `netraze-protocols::ntlm` | ✅ | Implémentation LDAP SASL partagée dans le crate protocoles; SMB et DCE/RPC restent inchangés jusqu'à migration validée |
 | SPNEGO wrapping | `netraze-protocols::ntlm::spnego` | ✅ | Parsing borné et `mechListMIC` validés pour LDAP SASL/GSS-SPNEGO |
-| Kerberos AS-REQ/REP, TGS-REQ/REP | `netraze-protocols::kerberos` (à créer) | 🔜 | Requis pour AS-REProast, Kerberoast, S4U |
+| Kerberos AS-REQ/REP, TGS-REQ/REP | `netraze-protocols::kerberos` | ✅ | TGT mot de passe/hash NT/clés AES, AS-REP et tickets de service ; S4U reste hors scope |
 
 ---
 
@@ -132,9 +132,9 @@ est limité à la lecture de RootDSE, sans assertion d'énumération du domaine.
 | Inventaire des ordinateurs | ✅ | Objets ordinateur, OS, SPN et indicateurs de délégation |
 | Inventaire des groupes | ✅ | Groupes, membres et groupes parents ; analyse des appartenances privilégiées |
 | OU, topologie et politique | ✅ | Conteneurs, domaines, trusts, sites, sous-réseaux, GPO et attributs de politique en lecture seule |
-| Comptes de service et SPN | ✅ | Découverte LDAP des principaux et SPN ; pas d'extraction de tickets Kerberos |
-| `find_kerberoastable` / extraction TGS | 🔜 | La découverte SPN est faite ; l'obtention et le traitement des tickets attendent `netraze-protocols::kerberos` |
-| `find_asreproastable` | 🔜 | Filtre `(&(samAccountType=805306368)(userAccountControl:1.2.840.113556.1.4.803:=4194304))` — alimente `netraze-protocols::kerberos::asreproast` |
+| Comptes de service et SPN | ✅ | Découverte LDAP des principaux et SPN, puis cibles de tickets de service pour l'évaluation Kerberos |
+| `find_kerberoastable` / extraction TGS | ✅ | TGT en mémoire, TGS-REQ avec checksum authenticator, validation TGS-REP et export explicite des artefacts |
+| `find_asreproastable` | ✅ | Bit UAC sans pré-auth extrait par l'inventaire, AS-REQ ciblé et export explicite des artefacts |
 | Indicateurs de délégation | ✅ | Bits UAC exposés dans l'inventaire utilisateur/ordinateur ; pas encore de module d'exploitation dédié |
 | RootDSE fetch (defaultNamingContext) | ✅ | Préliminaire à toute search |
 | Export BloodHound Community Edition | ✅ | Collecte des contextes Schema, domaine et Configuration par le transport LDAP/NTLM NetRaze, conversion via `rusthound-ce` 2.5.14, JSON schéma v6 et archive ZIP ; disponible en CLI et dans le nœud AD Directory du desktop |
@@ -160,16 +160,16 @@ enum_users(target, cred):
 
 ## Kerberos stack
 
-### `netraze-protocols::kerberos` (à créer après LDAP)
+### `netraze-protocols::kerberos`
 
 | Op | Statut | Use case |
 |---|---|---|
-| ASN.1 Kerberos types (PA-DATA, KrbPrincipalName, …) | 🔜 | Base |
-| AS-REQ / AS-REP | 🔜 | TGT acquisition + AS-REProast |
-| TGS-REQ / TGS-REP | 🔜 | Service ticket + Kerberoast |
-| Pre-auth disabled detection | 🔜 | AS-REProast filter |
-| Encrypt/decrypt RC4-HMAC, AES128/256-CTS-HMAC-SHA1-96 | 🔜 | Hash extraction des roastables |
-| Krb5 ASCII format (hashcat -m 18200, 13100) | 🔜 | Output |
+| ASN.1 Kerberos types (PA-DATA, principal, tickets, erreurs) | ✅ | `picky-krb`, DER strict et transport TCP borné |
+| AS-REQ / AS-REP | ✅ | TGT en mémoire avec mot de passe, hash NT, clé AES-128 ou AES-256 ; nonce, principal, realm et durée validés |
+| TGS-REQ / TGS-REP | ✅ | AP-REQ checksummé, authenticator chiffré, ticket de service validé contre le KDC Samba AD local |
+| Détection sans pré-auth | ✅ | Cibles explicites ou inventaire LDAP ; AS-REP validé live sur le fixture `asrep` |
+| Encrypt/decrypt RC4-HMAC, AES128/256-CTS-HMAC-SHA1-96 | ✅ | Vecteurs RFC/Impacket, échanges loopback et AES validé live ; le KDC MIT du fixture refuse les AS-REQ RC4-only par politique |
+| Format Krb5 ASCII (modes Hashcat 18200/19800/19900, 13100/19600/19700) | ✅ | Métadonnées sûres persistées ; matière sensible exportée seulement sur action explicite en fichier 0600 sous Unix |
 | Pass-the-ticket (kirbi/ccache) | ⚪ | Out v1 |
 | S4U2Self / S4U2Proxy | ⚪ | Constrained delegation abuse — phase 2 |
 | Diamond/Sapphire ticket | ⚪ | Phase 3 |
@@ -223,8 +223,8 @@ Statut **module-level** — peut composer plusieurs interfaces RPC.
 | `adcs` (cert template enum) | ✅ factory | `netraze-protocols::ldap` (CN=Configuration partition) |
 | `coerce_plus` (PetitPotam, PrinterBug, ShadowCoerce) | ✅ factory | dcerpc.efsrpc + dcerpc.rprn |
 | `dcsync` | 🔜 | dcerpc.drsuapi |
-| `kerberoast` | 🔜 | `netraze-protocols::{ldap, kerberos}` |
-| `asreproast` | 🔜 | `netraze-protocols::{ldap, kerberos}` |
+| `kerberoast` | ✅ | CLI et desktop via `netraze-protocols::{ldap, kerberos}` |
+| `asreproast` | ✅ | CLI et desktop via cibles explicites ou découverte LDAP |
 
 ### Credentials
 
@@ -250,9 +250,9 @@ Statut **module-level** — peut composer plusieurs interfaces RPC.
 ## Roadmap d'attaque (ordre opérationnel)
 
 L'ordre **chronologique** dans lequel je recommande d'avancer.
-Les chantiers 1–4 et 8 (SMB2 file ops, `exec_rpc`, `browser_rpc`, LDAP,
-SMB signing) sont **faits** ; le chantier LDAP et son export BloodHound CE
-sont validés contre le harness Samba AD local. Reste, chaque ligne débloquant
+Les chantiers 1–5 et 8 (SMB2 file ops, `exec_rpc`, `browser_rpc`, LDAP,
+Kerberos, SMB signing) sont **faits** ; LDAP, l'export BloodHound CE et les
+échanges Kerberos AS/TGS sont validés contre le harness Samba AD local. Reste, chaque ligne débloquant
 les suivantes :
 
 | # | Chantier | Coût | Débloque |
@@ -261,7 +261,7 @@ les suivantes :
 | ~~2~~ | ~~**Phase D.3** — `exec_rpc` via SCMR~~ | ✅ fait | smbexec complet (create/start/stop/delete) — wire-smoke Samba OK |
 | ~~3~~ | ~~**Phase D.4** — `browser_rpc`~~ | ✅ fait | browser cross-platform + suites browser_ops |
 | ~~4~~ | ~~**Module `netraze-protocols::ldap`** — BER, bind SASL/NTLMSSP, recherche paginée, inventaire AD et export BloodHound CE~~ | ✅ fait | Utilisateurs, groupes, ordinateurs, OU, topologie, privilèges, SPN, politiques rapportées et JSON/ZIP CE schéma v6 |
-| 5 | **Module `netraze-protocols::kerberos`** — ASN.1 Kerberos + AS-REQ/REP + TGS-REQ/REP + RC4/AES decrypt | 8j | AS-REProast + Kerberoast |
+| ~~5~~ | ~~**Module `netraze-protocols::kerberos`** — ASN.1 Kerberos + AS-REQ/REP + TGS-REQ/REP + RC4/AES decrypt~~ | ✅ fait | TGT, AS-REProast et Kerberoast en CLI/desktop ; pass-the-ticket et S4U restent séparés |
 | 6 | `dcerpc.lsarpc` — OpenPolicy2 + LookupSids/Names | 3j | Account naming dans LSA dump |
 | 7 | `dcerpc.drsuapi` — DRSBind + DRSGetNCChanges | 10j | **DCSync** = NTDS.dit complet sans toucher disque |
 | ~~8~~ | ~~SMB signing HMAC-SHA256~~ | ✅ fait | dialectes 2.0.2/2.1 — vérifié live contre un DC "require signing" |

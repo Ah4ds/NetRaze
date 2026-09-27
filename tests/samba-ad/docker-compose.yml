@@ -1,4 +1,5 @@
-# Isolated Samba Active Directory integration harness for NetRaze LDAP/NTLM.
+# Isolated Samba Active Directory integration harness for NetRaze LDAP/NTLM
+# and Kerberos.
 #
 # This service is deliberately separate from tests/samba: the standalone
 # server's guest/null-session behavior is load-bearing for the SMB suites.
@@ -13,6 +14,7 @@ services:
     ports:
       - "127.0.0.1:1389:389"
       - "127.0.0.1:2445:445"
+      - "127.0.0.1:1088:88/tcp"
     environment:
       SAMBACC_CONFIG_TEMPLATE: /config/domain.json
       SAMBA_CONTAINER_ID: netraze-ad
@@ -31,6 +33,19 @@ services:
       timeout: 5s
       retries: 30
       start_period: 30s
+
+  samba-ad-fixtures:
+    image: quay.io/samba.org/samba-ad-server@sha256:c7df8af6aff5477a26cfae8bd06bb323ddce01ed55474db29b4ab631ac84de87
+    container_name: netraze-samba-ad-fixtures
+    depends_on:
+      samba-ad:
+        condition: service_healthy
+    environment:
+      NETRAZE_SAMBA_AD_ADMIN_PASSWORD: ${NETRAZE_SAMBA_AD_ADMIN_PASSWORD:?set NETRAZE_SAMBA_AD_ADMIN_PASSWORD}
+    volumes:
+      - ./configure-kerberos-fixtures.sh:/config/configure-kerberos-fixtures.sh:ro
+    entrypoint: ["/bin/sh", "/config/configure-kerberos-fixtures.sh"]
+    restart: "no"
 
 volumes:
   samba-ad-state:

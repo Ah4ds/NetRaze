@@ -18,23 +18,26 @@ use picky_asn1::wrapper::{
 use picky_krb::constants::error_codes::KDC_ERR_PREAUTH_REQUIRED;
 use picky_krb::constants::key_usages::{
     TGS_REP_ENC_SESSION_KEY, TGS_REQ_PA_DATA_AP_REQ_AUTHENTICATOR,
+    TGS_REQ_PA_DATA_AP_REQ_AUTHENTICATOR_CKSUM,
 };
 use picky_krb::constants::types::{
     AP_REQ_MSG_TYPE, NT_PRINCIPAL, NT_SRV_INST, PA_TGS_REQ_TYPE, TGS_REQ_MSG_TYPE,
 };
 use picky_krb::data_types::{
-    ApOptions, Authenticator, AuthenticatorInner, EncryptedData, KerberosFlags, PaData, Ticket,
+    ApOptions, Authenticator, AuthenticatorInner, Checksum, EncryptedData, KerberosFlags, PaData,
+    Ticket,
 };
-use picky_krb::messages::{ApReq, ApReqInner, EncTgsRepPart, KdcReq, KdcReqBody, TgsRep, TgsReq};
+use picky_krb::messages::{ApReq, ApReqInner, KdcReq, KdcReqBody, TgsRep, TgsReq};
 use rand::rngs::OsRng;
 use rand::{CryptoRng, Rng, RngCore};
 use time::OffsetDateTime;
 
 use super::client::{
-    AsExchangeReply, build_as_req, decode_kdc_reply, encode_der, encrypted_data_type,
-    integer_as_i32, integer_as_u32, integer_i32, integer_u32, kdc_error, kerberos_string,
-    principal, principal_name, validate_der_envelope, validate_username,
+    AsExchangeReply, build_as_req, decode_enc_kdc_rep_part, decode_kdc_reply, encode_der,
+    encrypted_data_type, integer_as_i32, integer_as_u32, integer_i32, integer_u32, kdc_error,
+    kerberos_string, principal, principal_name, validate_der_envelope, validate_username,
 };
+use super::crypto::keyed_checksum;
 use super::{
     KerberosClient, KerberosEncryptionType, KerberosError, TicketGrantingTicket, decrypt, encrypt,
 };
@@ -462,7 +465,7 @@ fn build_tgs_req<R: RngCore + CryptoRng>(
     let service_name = principal(NT_SRV_INST, &components)?;
     let request_body = KdcReqBody {
         kdc_options: ExplicitContextTag0::from(KerberosFlags::from(BitString::with_bytes(vec![
-            0x40, 0x81, 0x00, 0x10,
+            0x40, 0x81, 0x00, 0x00,
         ]))),
         cname: Optional::from(None),
         realm: ExplicitContextTag2::from(kerberos_string(tgt.realm())?),
@@ -482,11 +485,21 @@ fn build_tgs_req<R: RngCore + CryptoRng>(
         enc_authorization_data: Optional::from(None),
         additional_tickets: Optional::from(None),
     };
+    let request_body_der = encode_der(&request_body)?;
+    let (checksum_type, checksum) = keyed_checksum(
+        tgt.session_encryption_type,
+        &tgt.session_key,
+        TGS_REQ_PA_DATA_AP_REQ_AUTHENTICATOR_CKSUM,
+        &request_body_der,
+    )?;
     let authenticator = Authenticator::from(AuthenticatorInner {
         authenticator_vno: ExplicitContextTag0::from(integer_i32(5)),
         crealm: ExplicitContextTag1::from(kerberos_string(tgt.realm())?),
         cname: ExplicitContextTag2::from(principal(NT_PRINCIPAL, &[tgt.client_principal()])?),
-        cksum: Optional::from(None),
+        cksum: Optional::from(Some(ExplicitContextTag3::from(Checksum {
+            cksumtype: ExplicitContextTag0::from(integer_i32(checksum_type)),
+            checksum: ExplicitContextTag1::from(OctetStringAsn1::from(checksum)),
+        }))),
         cusec: ExplicitContextTag4::from(integer_u32(now.microsecond().min(999_999))),
         ctime: ExplicitContextTag5::from(GeneralizedTimeAsn1::from(GeneralizedTime::from(now))),
         subkey: Optional::from(None),
@@ -574,17 +587,15 @@ fn finish_tgs_exchange(
         TGS_REP_ENC_SESSION_KEY,
         &reply.0.enc_part.0.cipher.0.0,
     )?;
-    let encrypted_part: EncTgsRepPart = picky_asn1_der::from_bytes(&plaintext)
-        .map_err(|error| KerberosError::InvalidMessage(error.to_string()))?;
-    if integer_as_u32(&encrypted_part.0.nonce.0) != Some(nonce)
+    let encrypted_part = decode_enc_kdc_rep_part(&plaintext)?;
+    if integer_as_u32(&encrypted_part.nonce.0) != Some(nonce)
         || !encrypted_part
-            .0
             .srealm
             .0
             .0
             .to_string()
             .eq_ignore_ascii_case(tgt.realm())
-        || !principal_name(&encrypted_part.0.sname.0).eq_ignore_ascii_case(requested_spn)
+        || !principal_name(&encrypted_part.sname.0).eq_ignore_ascii_case(requested_spn)
     {
         return Err(KerberosError::InvalidMessage(
             "TGS-REP service or nonce does not match the request".to_owned(),
@@ -600,11 +611,11 @@ fn finish_tgs_exchange(
         ));
     }
     let session_encryption_type = KerberosEncryptionType::from_number(
-        integer_as_i32(&encrypted_part.0.key.0.key_type.0).ok_or_else(|| {
+        integer_as_i32(&encrypted_part.key.0.key_type.0).ok_or_else(|| {
             KerberosError::InvalidMessage("invalid service session enctype".to_owned())
         })?,
     )?;
-    let session_key = encrypted_part.0.key.0.key_value.0.0.clone();
+    let session_key = encrypted_part.key.0.key_value.0.0.clone();
     if session_key.len() != session_encryption_type.key_len() {
         return Err(KerberosError::InvalidKeyLength {
             encryption_type: session_encryption_type.name(),
@@ -612,7 +623,7 @@ fn finish_tgs_exchange(
             actual: session_key.len(),
         });
     }
-    let valid_until = OffsetDateTime::try_from(encrypted_part.0.end_time.0.0.clone())
+    let valid_until = OffsetDateTime::try_from(encrypted_part.end_time.0.0.clone())
         .map_err(|error| KerberosError::InvalidMessage(error.to_string()))?
         .unix_timestamp();
     Ok(ServiceTicket {
@@ -765,7 +776,7 @@ mod tests {
     use super::*;
     use picky_asn1::wrapper::{ExplicitContextTag9, ExplicitContextTag10};
     use picky_krb::data_types::{EncryptionKey, LastReq, TicketInner};
-    use picky_krb::messages::{EncKdcRepPart, KdcRep, TgsRep};
+    use picky_krb::messages::{EncKdcRepPart, EncTgsRepPart, KdcRep, TgsRep};
 
     #[test]
     fn formats_rc4_and_aes_hashcat_material_like_impacket() {
@@ -814,7 +825,7 @@ mod tests {
             std::process::id(),
             OffsetDateTime::now_utc().unix_timestamp_nanos()
         ));
-        export_roast_artifacts(&path, &[artifact.clone()]).unwrap();
+        export_roast_artifacts(&path, std::slice::from_ref(&artifact)).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         assert_eq!(written.trim(), artifact.hashcat_line());
         #[cfg(unix)]
@@ -908,6 +919,16 @@ mod tests {
         let authenticator: Authenticator = picky_asn1_der::from_bytes(&plaintext).unwrap();
         assert_eq!(principal_name(&authenticator.0.cname.0), "alice");
         assert_eq!(authenticator.0.crealm.0.0.to_string(), "EXAMPLE.TEST");
+        let checksum = &authenticator.0.cksum.0.as_ref().unwrap().0;
+        let (expected_type, expected) = keyed_checksum(
+            KerberosEncryptionType::Rc4Hmac,
+            &tgt.session_key,
+            TGS_REQ_PA_DATA_AP_REQ_AUTHENTICATOR_CKSUM,
+            &encode_der(&decoded.0.req_body.0).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(integer_as_i32(&checksum.cksumtype.0), Some(expected_type));
+        assert_eq!(checksum.checksum.0.0, expected);
     }
 
     #[test]

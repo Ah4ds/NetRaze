@@ -73,7 +73,7 @@ pub fn aes_128_cbc_decrypt(ciphertext: &[u8], key: &[u8], iv: &[u8]) -> Result<V
     if key.len() != 16 || iv.len() != 16 {
         return Err("AES key must be 16 bytes, IV must be 16 bytes".into());
     }
-    if !ciphertext.len().is_multiple_of(16) {
+    if ciphertext.len() % 16 != 0 {
         return Err(format!(
             "AES-CBC (no padding) requires block-aligned input, got {} bytes",
             ciphertext.len()
@@ -96,7 +96,7 @@ pub fn aes_256_cbc_decrypt(ciphertext: &[u8], key: &[u8], iv: &[u8]) -> Result<V
     if key.len() != 32 || iv.len() != 16 {
         return Err("AES-256 key must be 32 bytes, IV must be 16 bytes".into());
     }
-    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
+    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
         return Err(format!(
             "AES-256-CBC requires block-aligned input, got {} bytes",
             ciphertext.len()
@@ -117,7 +117,7 @@ pub fn aes_256_lsa_decrypt(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>, Str
     if key.len() != 32 {
         return Err("aes_256_lsa_decrypt: key must be 32 bytes".into());
     }
-    if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(16) {
+    if ciphertext.is_empty() || ciphertext.len() % 16 != 0 {
         return Err(format!(
             "aes_256_lsa_decrypt: input must be block-aligned, got {} bytes",
             ciphertext.len()

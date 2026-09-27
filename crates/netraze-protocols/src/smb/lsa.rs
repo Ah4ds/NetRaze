@@ -301,7 +301,7 @@ fn get_lsa_key_vista(boot_key: &[u8], security_hive: &Hive) -> Result<Vec<u8>, S
                         aes_256_lsa_decrypt(&nlkm_record.encrypted_data[32..], &cand_tmp)
                     {
                         if let Ok(nlkm_blob) = parse_lsa_secret_blob(&pt) {
-                            if nlkm_blob.secret.len() > 0 && nlkm_blob.secret.len() <= 256 {
+                            if !nlkm_blob.secret.is_empty() && nlkm_blob.secret.len() <= 256 {
                                 return Ok(candidate.to_vec());
                             }
                         }

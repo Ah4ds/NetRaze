@@ -13,7 +13,7 @@
 - **Memory-safe wire protocols** — SMB2, NTLMSSP, and DCE/RPC are re-implemented in Rust and validated byte-for-byte against Impacket-generated fixtures. No FFI to Impacket or Samba libraries.
 - **Cross-platform attacker OS** — Linux and Windows are equally capable attacker platforms. The cross-platform portage is complete: every SMB capability is pure Rust, and the `windows` crate is no longer a dependency of any protocol crate.
 
-**Status:** Alpha. SMB2 + NTLMv2 (including anonymous null sessions and guest access) are the most mature protocols; the SMB post-exploitation surface (share/user enumeration, file browser, smbexec, SAM/LSA dump, AV enum) is fully ported and covered by the Samba integration harness. LDAP now supports NTLMv2 SASL sign-and-seal, anonymous bind, RootDSE, paged AD user enumeration, read-only directory inventory, and BloodHound Community Edition schema-v6 JSON/ZIP export. Kerberos and deeper LDAP security probes remain future work (see `docs/protocol-stack-plan.md`).
+**Status:** Alpha. SMB2 + NTLMv2 (including anonymous null sessions and guest access) are the most mature protocols; the SMB post-exploitation surface (share/user enumeration, file browser, smbexec, SAM/LSA dump, AV enum) is fully ported and covered by the Samba integration harness. LDAP supports NTLMv2 SASL sign-and-seal, anonymous bind, RootDSE, paged AD user enumeration, read-only directory inventory, and BloodHound Community Edition schema-v6 JSON/ZIP export. Kerberos now provides bounded TCP KDC transport, password/NT-hash/AES TGT acquisition, LDAP-assisted AS-REP and service-ticket assessment, and explicit artifact export. Ticket-backed SMB/LDAP sessions, ticket import, S4U, and deeper LDAP security probes remain future work (see `docs/protocol-stack-plan.md`).
 
 **License:** BSD-2-Clause.
 
@@ -29,6 +29,7 @@
 - **Serialization:** `serde` + `serde_json`.
 - **Diagnostics:** `tracing` + `tracing-subscriber`.
 - **Crypto:** `aes`, `cbc`, `cipher`, `des`, `hmac`, `md-5`, `md4`, `rand`.
+- **Kerberos ASN.1/crypto:** `picky-asn1`, `picky-asn1-der`, and `picky-krb`; NetRaze supplies bounded exchange validation plus the RC4-HMAC profile omitted by the dependency.
 - **Graph / workflow UI:** `egui-snarl` (node graph), `egui_graphs`, `petgraph`.
 - **BloodHound CE adapter:** `rusthound-ce` 2.5.14 with `nogssapi`; NetRaze supplies the LDAP/NTLM transport and uses the dependency for CE object/relationship parsing and schema-v6 output.
 
@@ -46,7 +47,7 @@ This is a Cargo workspace with 14 members (13 application crates + `xtask`).
 | `netraze-app` | Composition root / service wiring. | The only crate allowed to know almost everything. Bootstraps registries, storage, output, config, and runtime. |
 | `netraze-cli` | Thin CLI binary (`clap`). | **Must contain zero protocol logic.** Entry point for headless use. |
 | `netraze-desktop` | `egui`/`eframe` GUI with node-graph workflow canvas. | Binary crate. Uses `wgpu` backend and `egui-snarl` for visual workflows. |
-| `netraze-protocols` | Wire-level protocol handlers. | SMB and LDAP are implemented in pure Rust. LDAP/NTLM and the BloodHound CE adapter live under this crate, not in separate workspace crates. SSH, WinRM, RDP, FTP, MSSQL, NFS, VNC, and WMI remain scaffold-only. |
+| `netraze-protocols` | Wire-level protocol handlers. | SMB, LDAP/NTLM, and Kerberos are implemented in pure Rust. The BloodHound CE adapter also lives under this crate, not in separate workspace crates. SSH, WinRM, RDP, FTP, MSSQL, NFS, VNC, and WMI remain scaffold-only. |
 | `netraze-dcerpc` | Pure-Rust DCE/RPC v5 stack. | NDR20, PDU framing, NTLMSSP auth verifier, interfaces: SRVSVC, SAMR, WINREG, SCMR. No `cfg(windows)` allowed inside this crate. |
 | `netraze-modules` | Post-exploitation module registry. | Categories: `active_directory`, `credentials`, `reconnaissance`. |
 | `netraze-auth` | Credential types and authentication methods. | `CredentialSet`, `SecretMaterial`, `AuthMethod`. |
@@ -121,7 +122,7 @@ cargo build --release
 # NDR / PDU / NTLMSSP / interface unit tests
 cargo test -p netraze-dcerpc
 
-# SMB crypto, LDAP/NTLM vectors, framing, filter, and dispatcher tests
+# SMB crypto, LDAP/NTLM, Kerberos, framing, filter, and dispatcher tests
 cargo test -p netraze-protocols
 ```
 
@@ -143,11 +144,11 @@ The CLI-only build needs none of these.
 ## Testing Strategy
 
 NetRaze uses known-answer vectors, pinned byte fixtures, and isolated live
-harnesses for the implemented SMB/DCE-RPC and LDAP stacks:
+harnesses for the implemented SMB/DCE-RPC, LDAP/NTLM, and Kerberos stacks:
 
 ### 1. Known-Answer Crypto Vectors
 
-NTLMv2 response computation, NTOWFv2, SIGN/SEAL key derivation, and RC4 keystream are validated against MS-NLMP test vectors. These are fast unit tests that run on every `cargo test`.
+NTLMv2 response computation, NTOWFv2, SIGN/SEAL key derivation, and RC4 keystream are validated against MS-NLMP test vectors. Kerberos RC4-HMAC encryption/checksums and AES string-to-key use pinned Impacket/RFC vectors. These are fast unit tests that run on every `cargo test`.
 
 ### 2. Impacket-Pinned Byte Fixtures
 
@@ -183,19 +184,22 @@ Environment variable `NETRAZE_SAMBA_ADDR` defaults to `127.0.0.1:1445` and can b
 
 **Impacket cross-check is a standing rule:** when SMB wire behaviour changes, verify the new behaviour against Impacket running against the same harness before committing, and pin the result in a test. Several suites carry comments noting "identical to Impacket" for exactly this reason.
 
-### 4. Local Samba AD LDAP Harness
+### 4. Local Samba AD LDAP/Kerberos Harness
 
 Directory: `tests/samba-ad/` (separate from the SMB fixture).
 
-- The digest-pinned Samba AD DC exposes LDAP on `127.0.0.1:1389` and SMB on `127.0.0.1:2445`; test accounts and domain data are disposable fixtures, while passwords are injected from `NETRAZE_SAMBA_AD_ADMIN_PASSWORD` and `NETRAZE_SAMBA_AD_PASSWORD` at runtime.
+- The digest-pinned Samba AD DC exposes LDAP on `127.0.0.1:1389`, SMB on `127.0.0.1:2445`, and its TCP KDC on `127.0.0.1:1088`; test accounts and domain data are disposable fixtures, while passwords are injected from `NETRAZE_SAMBA_AD_ADMIN_PASSWORD` and `NETRAZE_SAMBA_AD_PASSWORD` at runtime.
 - `ldap_samba_ad` is ignored by default. Its seven tests exercise NTLM password and NT-hash bind, required sign-and-seal, RootDSE, multi-page users, the complete read-only inventory (groups, computers, OUs, topology, privileged principals, SPNs, reported security settings), and BloodHound CE schema-v6 JSON/ZIP export across the Schema, default-domain, and Configuration naming contexts. They also check anonymous RootDSE access, wrong-password and Guest rejection, protected escaped-filter search, and returned referrals.
+- `kerberos_samba_ad` is also ignored by default. Its four tests cover password/AES TGT acquisition, wrong-password rejection, LDAP-discovered AS-REP and service-SPN candidates, and AS/TGS artifact collection. The pinned MIT-backed KDC rejects RC4-only AS requests by policy, so the live suite asserts that explicit error while a deterministic loopback exchange validates successful NT-hash/RC4 pre-authentication.
 - It has a fixed loopback endpoint and no environment override. Anonymous bind is covered by both a loopback mock-server test and a live RootDSE assertion against the local Samba AD DC; anonymous domain-wide enumeration is not asserted. Do not add real-environment credentials or targets to tests.
 
 ```bash
 export NETRAZE_SAMBA_AD_ADMIN_PASSWORD="Aa1!$(openssl rand -hex 20)"
 export NETRAZE_SAMBA_AD_PASSWORD="Aa1!$(openssl rand -hex 20)"
 docker compose -f tests/samba-ad/docker-compose.yml up -d --wait
-cargo test -p netraze-protocols --test ldap_samba_ad -- --ignored --test-threads=1
+cargo test -p netraze-protocols \
+  --test ldap_samba_ad --test kerberos_samba_ad \
+  -- --ignored --test-threads=1
 docker compose -f tests/samba-ad/docker-compose.yml down -v
 ```
 
@@ -235,6 +239,7 @@ The fmt / clippy / test gates are not enforced by CI today — run them locally 
 - Follow standard Rust naming (`PascalCase` for types/traits, `snake_case` for functions/variables/modules, `SCREAMING_SNAKE_CASE` for constants).
 - **Credential shape carries auth intent** in `SmbCredential`: empty username → anonymous null session; username with no hash and no password → guest; anything else → strict password/pass-the-hash (a wrong password is *rejected*, never silently downgraded to guest). Guest and null sessions bind DCE/RPC unauthenticated over the SMB session (Impacket parity) — see `smb/rpc.rs::bind_interface_over_smb`.
 - **LDAP authorization is explicit:** a named account uses NTLMv2 SASL/SPNEGO sign-and-seal with a password or NT hash; an empty-name/empty-password bind is anonymous and unprotected. `Guest` with an empty password is a named NTLM attempt, not a fallback. LDAP referrals are reported, never chased with credentials.
+- **Kerberos secrets stay explicit:** passwords, NT hashes, and AES keys can acquire an in-memory TGT; ticket import is not implemented. Safe finding metadata may be persisted, but Hashcat-compatible artifact material remains transient and is written only through an explicit export action using mode 0600 on Unix.
 - **Desktop scan credentials:** blank Configuration fields reuse each target host's current `Login As` credential, or anonymous when none exists. Entered credentials override the host login and are upserted into Credential Manager. The workflow login menu deduplicates session and saved copies by identity; session copies take precedence. Workspace saves serialize Credential Manager secrets, so do not commit workspace JSON containing real credentials.
 - Sanity caps on untrusted input allocations (e.g., `MAX_SHARES_PER_RESPONSE = 65_536`, `64 KiB` wstring cap) to prevent malicious server inputs from forcing huge allocations.
 
@@ -278,6 +283,7 @@ a dependency of `netraze-protocols`:
 **What this means for agents:**
 - If you modify `netraze-dcerpc` or `netraze-protocols::smb`, run the nine explicitly selected SMB suites shown above; `cargo test -p netraze-protocols -- --ignored` also selects the separate LDAP AD suite and is not an SMB-only command. Cross-check SMB wire behaviour changes against Impacket.
 - If you modify `netraze-protocols::ldap` or its NTLM SASL path, run its unit tests and the ignored `ldap_samba_ad` suite against the local Samba AD harness. Do not redirect the fixed-endpoint suite to a real AD environment.
+- If you modify `netraze-protocols::kerberos`, run its unit/loopback tests and the ignored `kerberos_samba_ad` suite against the same fixed-loopback Samba AD harness. Run `ldap_samba_ad` too when LDAP target discovery changes.
 - If you add a new DCE/RPC interface, follow the fixture pattern: write a `gen_*.py` script that uses Impacket to generate bytes, paste the bytes into a Rust test, and add a round-trip test.
 - Never re-introduce `#[cfg(windows)]` protocol paths in `netraze-protocols` or any `cfg`-gating in `netraze-dcerpc` — those crates are 100% cross-platform by policy.
 
@@ -293,11 +299,12 @@ a dependency of `netraze-protocols`:
 | `docs/migration-roadmap.md` | Detailed structural roadmap + the (now complete) cross-platform portage plan. |
 | `docs/protocol-stack-plan.md` | Operational inventory of every protocol interface NetRaze needs — the "what do we attack next" table. |
 | `crates/netraze-protocols/src/ldap/bloodhound.rs` | NetRaze LDAP-to-RustHound adapter and the public BloodHound CE export API. |
+| `crates/netraze-protocols/src/kerberos/` | Bounded KDC transport, AS/TGS exchanges, RC4/AES crypto, assessment orchestration, and artifact export. |
 | `tests/samba/README.md` | Operator guide for the live integration harness (suite list, known Samba limits). |
-| `tests/samba-ad/README.md` | Fixed-loopback LDAP/NTLM AD harness and test-data guide. |
+| `tests/samba-ad/README.md` | Fixed-loopback LDAP/NTLM/Kerberos AD harness and test-data guide. |
 | `crates/netraze-dcerpc/tests/gen_srvs_fixture.py` | Pattern for Impacket-pinned byte fixtures. |
 | `crates/netraze-protocols/tests/gen_ldap_fixtures.py` | LDAP Impacket fixture generator; fixture bytes are pinned in Rust tests. |
-| `crates/netraze-protocols/tests/` | SMB and LDAP integration suites (`#[ignore]` by default). |
+| `crates/netraze-protocols/tests/` | SMB, LDAP, and Kerberos integration suites (`#[ignore]` by default). |
 | `.github/workflows/release.yml` | Tag-driven Linux + Windows desktop release builds. |
 
 ---
@@ -314,6 +321,8 @@ cargo run -p netraze-cli -- modules
 cargo run -p netraze-cli -- plan smb 10.10.10.0/24 --module shares
 # BloodHound CE: see README.md for password/hash environment-variable usage
 cargo run -p netraze-cli -- bloodhound-ce --help
+# Kerberos TGT validation and assessment commands
+cargo run -p netraze-cli -- kerberos --help
 
 # Run the GUI
 cargo run -p netraze-desktop
@@ -335,11 +344,13 @@ cargo test -p netraze-protocols \
   -- --ignored --test-threads=1
 docker compose -f tests/samba/docker-compose.yml down -v
 
-# LDAP/NTLM integration (separate local Samba AD DC)
+# LDAP/NTLM/Kerberos integration (separate local Samba AD DC/KDC)
 export NETRAZE_SAMBA_AD_ADMIN_PASSWORD="Aa1!$(openssl rand -hex 20)"
 export NETRAZE_SAMBA_AD_PASSWORD="Aa1!$(openssl rand -hex 20)"
 docker compose -f tests/samba-ad/docker-compose.yml up -d --wait
-cargo test -p netraze-protocols --test ldap_samba_ad -- --ignored --test-threads=1
+cargo test -p netraze-protocols \
+  --test ldap_samba_ad --test kerberos_samba_ad \
+  -- --ignored --test-threads=1
 docker compose -f tests/samba-ad/docker-compose.yml down -v
 
 # Release (tag-driven — builds Linux + Windows binaries on GitHub Actions)
