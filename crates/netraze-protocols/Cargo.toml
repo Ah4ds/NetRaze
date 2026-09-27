@@ -14,6 +14,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "net"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+time = { workspace = true }
 rasn = { workspace = true }
 rasn-ldap = { workspace = true }
 rusthound-ce = { workspace = true }
@@ -29,6 +30,7 @@ log = { workspace = true }
 md-5 = { workspace = true }
 md4 = { workspace = true }
 rand = { workspace = true }
+serde = { workspace = true }
 sha2 = { workspace = true }
 picky-asn1 = { workspace = true }
 picky-asn1-der = { workspace = true }
