@@ -32,6 +32,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                     CredType::Password if cred.secret.is_empty() => "GUEST",
                     CredType::Password => "PWD",
                     CredType::Hash => "HASH",
+                    CredType::Aes128Key => "AES128",
+                    CredType::Aes256Key => "AES256",
                 };
                 let (valid_icon, valid_color) = match cred.valid {
                     Some(true) => ("✔", theme::SUCCESS),
@@ -42,6 +44,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                     CredType::Password if cred.secret.is_empty() => theme::SUCCESS,
                     CredType::Password => theme::INFO,
                     CredType::Hash => theme::WARNING,
+                    CredType::Aes128Key | CredType::Aes256Key => theme::ACC,
                 };
 
                 let bg = if is_selected {
@@ -121,28 +124,40 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
         );
         ui.add(
             egui::TextEdit::singleline(&mut state.new_cred_secret)
-                .hint_text(if state.new_cred_type == CredType::Password {
-                    "secret (empty = guest)"
-                } else {
-                    "nt hash"
+                .hint_text(match state.new_cred_type {
+                    CredType::Password => "secret (empty = guest)",
+                    CredType::Hash => "nt hash",
+                    CredType::Aes128Key => "AES-128 key",
+                    CredType::Aes256Key => "AES-256 key",
                 })
                 .desired_width(70.0)
                 .font(egui::TextStyle::Small),
         );
     });
     ui.horizontal(|ui| {
-        let is_hash = state.new_cred_type == CredType::Hash;
         if ui
-            .add(egui::Button::new("Pwd").selected(!is_hash))
+            .add(egui::Button::new("Pwd").selected(state.new_cred_type == CredType::Password))
             .clicked()
         {
             state.new_cred_type = CredType::Password;
         }
         if ui
-            .add(egui::Button::new("Hash").selected(is_hash))
+            .add(egui::Button::new("Hash").selected(state.new_cred_type == CredType::Hash))
             .clicked()
         {
             state.new_cred_type = CredType::Hash;
+        }
+        if ui
+            .add(egui::Button::new("A128").selected(state.new_cred_type == CredType::Aes128Key))
+            .clicked()
+        {
+            state.new_cred_type = CredType::Aes128Key;
+        }
+        if ui
+            .add(egui::Button::new("A256").selected(state.new_cred_type == CredType::Aes256Key))
+            .clicked()
+        {
+            state.new_cred_type = CredType::Aes256Key;
         }
 
         let has_secret = !state.new_cred_secret.is_empty();

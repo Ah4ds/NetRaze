@@ -107,6 +107,16 @@ pub enum WorkflowNode {
         #[serde(default)]
         cred_label: Option<String>,
     },
+    KerberosAssessmentNode {
+        endpoint: String,
+        realm: String,
+        findings: Vec<netraze_core::KerberosFinding>,
+        errors: Vec<netraze_core::KerberosTargetError>,
+        #[serde(default)]
+        error: Option<String>,
+        #[serde(default)]
+        cred_label: Option<String>,
+    },
     DumpNode {
         host_ip: String,
         hostname: String,
@@ -211,6 +221,19 @@ impl WorkflowNode {
                     .as_ref()
                     .map_or(0, |value| value.users.items.len());
                 format!("📚 AD Directory ({users} users) — {host}")
+            }
+            WorkflowNode::KerberosAssessmentNode {
+                endpoint,
+                realm,
+                findings,
+                ..
+            } => {
+                let target = if realm.is_empty() {
+                    endpoint.as_str()
+                } else {
+                    realm.as_str()
+                };
+                format!("🎟 Kerberos ({} findings) — {target}", findings.len())
             }
             WorkflowNode::DumpNode {
                 host_ip,
@@ -476,6 +499,7 @@ impl SnarlViewer<WorkflowNode> for WorkflowViewer {
             WorkflowNode::SharesNode { .. } => 1,
             WorkflowNode::UsersNode { .. } => 1,
             WorkflowNode::DirectoryNode { .. } => 1,
+            WorkflowNode::KerberosAssessmentNode { .. } => 1,
             WorkflowNode::DumpNode { .. } => 1,
             WorkflowNode::EnumAvNode { .. } => 1,
         }
@@ -493,6 +517,7 @@ impl SnarlViewer<WorkflowNode> for WorkflowViewer {
             WorkflowNode::SharesNode { .. } => 0,
             WorkflowNode::UsersNode { .. } => 0,
             WorkflowNode::DirectoryNode { .. } => 0,
+            WorkflowNode::KerberosAssessmentNode { .. } => 0,
             WorkflowNode::DumpNode { .. } => 0,
             WorkflowNode::EnumAvNode { .. } => 0,
         }
@@ -529,6 +554,7 @@ impl SnarlViewer<WorkflowNode> for WorkflowViewer {
             WorkflowNode::SharesNode { .. }
             | WorkflowNode::UsersNode { .. }
             | WorkflowNode::DirectoryNode { .. }
+            | WorkflowNode::KerberosAssessmentNode { .. }
             | WorkflowNode::DumpNode { .. }
             | WorkflowNode::EnumAvNode { .. } => {
                 // Circular nodes — content is in the config panel, not the pin row.
@@ -539,6 +565,7 @@ impl SnarlViewer<WorkflowNode> for WorkflowViewer {
             WorkflowNode::SharesNode { .. }
                 | WorkflowNode::UsersNode { .. }
                 | WorkflowNode::DirectoryNode { .. }
+                | WorkflowNode::KerberosAssessmentNode { .. }
                 | WorkflowNode::DumpNode { .. }
                 | WorkflowNode::EnumAvNode { .. }
         );
@@ -593,6 +620,10 @@ impl SnarlViewer<WorkflowNode> for WorkflowViewer {
                 ui.label("-");
                 PinInfo::circle().with_fill(Color32::from_rgb(80, 170, 255))
             }
+            WorkflowNode::KerberosAssessmentNode { .. } => {
+                ui.label("-");
+                PinInfo::circle().with_fill(Color32::from_rgb(80, 170, 255))
+            }
             WorkflowNode::DumpNode { .. } => {
                 ui.label("-");
                 PinInfo::circle().with_fill(Color32::from_rgb(80, 170, 255))
@@ -630,6 +661,7 @@ impl SnarlViewer<WorkflowNode> for WorkflowViewer {
                 | WorkflowNode::SharesNode { .. }
                 | WorkflowNode::UsersNode { .. }
                 | WorkflowNode::DirectoryNode { .. }
+                | WorkflowNode::KerberosAssessmentNode { .. }
                 | WorkflowNode::DumpNode { .. }
                 | WorkflowNode::EnumAvNode { .. }
         );
@@ -658,6 +690,7 @@ impl SnarlViewer<WorkflowNode> for WorkflowViewer {
             WorkflowNode::SharesNode { .. }
             | WorkflowNode::UsersNode { .. }
             | WorkflowNode::DirectoryNode { .. }
+            | WorkflowNode::KerberosAssessmentNode { .. }
             | WorkflowNode::DumpNode { .. }
             | WorkflowNode::EnumAvNode { .. } => NodeLayout {
                 kind: NodeLayoutKind::Sandwich,
@@ -675,6 +708,7 @@ impl SnarlViewer<WorkflowNode> for WorkflowViewer {
                 | WorkflowNode::SharesNode { .. }
                 | WorkflowNode::UsersNode { .. }
                 | WorkflowNode::DirectoryNode { .. }
+                | WorkflowNode::KerberosAssessmentNode { .. }
                 | WorkflowNode::DumpNode { .. }
                 | WorkflowNode::EnumAvNode { .. }
         )
@@ -772,6 +806,27 @@ impl SnarlViewer<WorkflowNode> for WorkflowViewer {
                     theme::MUTED
                 };
                 Some(("📚", label, border))
+            }
+            WorkflowNode::KerberosAssessmentNode {
+                endpoint,
+                realm,
+                findings,
+                error,
+                ..
+            } => {
+                let label = if realm.is_empty() {
+                    endpoint.clone()
+                } else {
+                    realm.clone()
+                };
+                let border = if error.is_some() {
+                    theme::ERROR
+                } else if findings.is_empty() {
+                    theme::MUTED
+                } else {
+                    theme::WARNING
+                };
+                Some(("🎟", label, border))
             }
             WorkflowNode::DumpNode {
                 host_ip,
@@ -982,6 +1037,7 @@ impl SnarlViewer<WorkflowNode> for WorkflowViewer {
                 | WorkflowNode::SharesNode { .. }
                 | WorkflowNode::UsersNode { .. }
                 | WorkflowNode::DirectoryNode { .. }
+                | WorkflowNode::KerberosAssessmentNode { .. }
                 | WorkflowNode::DumpNode { .. }
                 | WorkflowNode::EnumAvNode { .. }
         );
@@ -1013,6 +1069,7 @@ impl SnarlViewer<WorkflowNode> for WorkflowViewer {
                 | WorkflowNode::SharesNode { .. }
                 | WorkflowNode::UsersNode { .. }
                 | WorkflowNode::DirectoryNode { .. }
+                | WorkflowNode::KerberosAssessmentNode { .. }
                 | WorkflowNode::DumpNode { .. }
                 | WorkflowNode::EnumAvNode { .. }
         );
@@ -1394,6 +1451,8 @@ impl SnarlViewer<WorkflowNode> for WorkflowViewer {
 
                         let type_tag = match cred.cred_type {
                             crate::state::CredType::Hash => "🔒",
+                            crate::state::CredType::Aes128Key
+                            | crate::state::CredType::Aes256Key => "🎟",
                             // Secret-less password credential = guest access.
                             crate::state::CredType::Password if cred.secret.is_empty() => "👤",
                             crate::state::CredType::Password => "🔑",

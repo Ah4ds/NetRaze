@@ -34,6 +34,6 @@ pub fn factory() -> StaticProtocolFactory {
 }
 pub use assessment::{
     KerberosAssessmentOutcome, KerberosAssessmentTargets, RoastArtifact, ServicePrincipalTarget,
-    ServiceTicket, targets_from_inventory,
+    ServiceTicket, export_roast_artifacts, targets_from_inventory,
 };
 pub use client::{KerberosClient, KerberosClientConfig, KerberosCredential, TicketGrantingTicket};

@@ -56,6 +56,8 @@ pub struct NetworkSubnet {
 pub enum CredType {
     Password,
     Hash,
+    Aes128Key,
+    Aes256Key,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +157,7 @@ pub struct CredentialConfig {
     pub username: String,
     pub password: String,
     pub ntlm_hash: String,
+    pub kerberos_aes_key: String,
     pub kerberos_ticket: String,
 }
 
@@ -162,6 +165,9 @@ impl CredentialConfig {
     /// Build a credential from the Configuration fields. The caller decides
     /// whether to save it to Credential Manager when the scan starts.
     pub fn as_record(&self) -> Result<Option<CredentialRecord>, String> {
+        if !self.kerberos_aes_key.trim().is_empty() {
+            return Err("Kerberos AES keys can only be used by Kerberos scans".to_owned());
+        }
         if !self.kerberos_ticket.trim().is_empty() {
             return Err(
                 "Kerberos ticket authentication is not available for these scans".to_owned(),
@@ -194,6 +200,101 @@ impl CredentialConfig {
             cred_type,
             ..anonymous_record()
         }))
+    }
+
+    /// Build a password, NT-hash, or AES-key credential for a Kerberos scan.
+    /// Exactly one secret form may be supplied. Blank fields retain the
+    /// desktop's normal per-host `Login As` behavior.
+    pub fn as_kerberos_record(&self) -> Result<Option<CredentialRecord>, String> {
+        if !self.kerberos_ticket.trim().is_empty() {
+            return Err("Kerberos ticket import is not supported yet".to_owned());
+        }
+        let secret_count = usize::from(!self.password.is_empty())
+            + usize::from(!self.ntlm_hash.trim().is_empty())
+            + usize::from(!self.kerberos_aes_key.trim().is_empty());
+        if secret_count > 1 {
+            return Err("Enter exactly one Kerberos secret: password, NT hash, or AES key".into());
+        }
+
+        let entered = self.username.trim();
+        if entered.is_empty() {
+            if secret_count == 0 {
+                return Ok(None);
+            }
+            return Err("Enter a username for the supplied Kerberos secret".to_owned());
+        }
+        let (domain, username) = entered
+            .split_once('\\')
+            .map_or(("", entered), |(domain, username)| (domain, username));
+        if username.is_empty() {
+            return Err("Enter a username after the domain separator".to_owned());
+        }
+        if secret_count == 0 {
+            return Err("Kerberos authentication requires a password, NT hash, or AES key".into());
+        }
+
+        let (secret, cred_type) = if !self.password.is_empty() {
+            (self.password.clone(), CredType::Password)
+        } else if !self.ntlm_hash.trim().is_empty() {
+            let hash = self.ntlm_hash.trim();
+            netraze_protocols::kerberos::KerberosCredential::from_nt_hash_hex(hash)
+                .map_err(|error| error.to_string())?;
+            (hash.to_owned(), CredType::Hash)
+        } else {
+            let key = self.kerberos_aes_key.trim();
+            let cred_type = match key.len() {
+                32 => {
+                    netraze_protocols::kerberos::KerberosCredential::from_aes128_hex(key)
+                        .map_err(|error| error.to_string())?;
+                    CredType::Aes128Key
+                }
+                64 => {
+                    netraze_protocols::kerberos::KerberosCredential::from_aes256_hex(key)
+                        .map_err(|error| error.to_string())?;
+                    CredType::Aes256Key
+                }
+                _ => {
+                    return Err(
+                        "Kerberos AES keys must contain 32 (AES-128) or 64 (AES-256) hexadecimal characters"
+                            .to_owned(),
+                    );
+                }
+            };
+            (key.to_owned(), cred_type)
+        };
+
+        Ok(Some(CredentialRecord {
+            username: username.to_owned(),
+            domain: domain.to_owned(),
+            secret,
+            cred_type,
+            ..anonymous_record()
+        }))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct KerberosScanConfig {
+    pub realm: String,
+    pub kdc_override: String,
+    pub assess_as_rep: bool,
+    pub assess_spns: bool,
+    pub use_ldap_discovery: bool,
+    pub explicit_principals: String,
+    pub explicit_spns: String,
+}
+
+impl Default for KerberosScanConfig {
+    fn default() -> Self {
+        Self {
+            realm: String::new(),
+            kdc_override: String::new(),
+            assess_as_rep: true,
+            assess_spns: true,
+            use_ldap_discovery: true,
+            explicit_principals: String::new(),
+            explicit_spns: String::new(),
+        }
     }
 }
 
@@ -291,6 +392,7 @@ pub struct AppState {
     pub selected_workflow_node: Option<usize>,
     pub target_config: TargetConfig,
     pub credential_config: CredentialConfig,
+    pub kerberos_config: KerberosScanConfig,
     pub status_text: String,
     /// Visibility of the resizable Network / Credentials / Progress dock.
     /// Layout preferences are local to the current app session.
@@ -305,6 +407,9 @@ pub struct AppState {
     /// Transient BloodHound exports keyed by LDAP endpoint. Secrets and export
     /// state are deliberately excluded from workspace serialization.
     pub bloodhound_exports: HashMap<String, BloodHoundExportState>,
+    /// Sensitive roast lines are session-only and never included in a
+    /// workspace save. Persisted Kerberos nodes contain safe metadata only.
+    pub kerberos_artifacts: HashMap<String, Vec<netraze_protocols::kerberos::RoastArtifact>>,
     pub pending_logins: Vec<(String, CredentialRecord)>,
     /// (host_node_id_raw, ip, hostname, credential)
     pub pending_share_enums: Vec<(usize, String, String, CredentialRecord)>,
@@ -354,8 +459,10 @@ impl AppState {
                 username: String::new(),
                 password: String::new(),
                 ntlm_hash: String::new(),
+                kerberos_aes_key: String::new(),
                 kerberos_ticket: String::new(),
             },
+            kerberos_config: KerberosScanConfig::default(),
             status_text: "Idle".to_owned(),
             bottom_panel_open: true,
             is_running: false,
@@ -366,6 +473,7 @@ impl AppState {
             progress: 0.0,
             progress_message: String::new(),
             bloodhound_exports: HashMap::new(),
+            kerberos_artifacts: HashMap::new(),
             pending_logins: Vec::new(),
             pending_share_enums: Vec::new(),
             pending_user_enums: Vec::new(),
@@ -1034,6 +1142,115 @@ impl AppState {
                         self.selected_workflow_node = Some(directory_id.0);
                     }
                 }
+                RuntimeEvent::KerberosResult {
+                    endpoint,
+                    realm,
+                    cred_label,
+                    result,
+                } => {
+                    let host_target = netraze_protocols::targets::endpoint_host(&endpoint);
+                    let (findings, errors, error, artifacts) = match result {
+                        Ok(outcome) => (
+                            outcome.findings,
+                            outcome.errors,
+                            None,
+                            Some(outcome.artifacts),
+                        ),
+                        Err(message) => (Vec::new(), Vec::new(), Some(message), None),
+                    };
+                    if let Some(artifacts) = artifacts {
+                        self.kerberos_artifacts.insert(endpoint.clone(), artifacts);
+                    } else {
+                        self.kerberos_artifacts.remove(&endpoint);
+                    }
+
+                    let host_id = self
+                        .workflow
+                        .snarl
+                        .node_ids()
+                        .find_map(|(id, node)| match node {
+                            WorkflowNode::HostNode { ip, .. }
+                                if netraze_protocols::targets::endpoint_host(ip)
+                                    .eq_ignore_ascii_case(&host_target) =>
+                            {
+                                Some(id)
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| {
+                            let count = self.workflow.snarl.nodes().count() as f32;
+                            self.workflow.snarl.insert_node(
+                                egui::Pos2::new(
+                                    40.0 + (count % 4.0) * 280.0,
+                                    40.0 + (count / 4.0).floor() * 200.0,
+                                ),
+                                WorkflowNode::HostNode {
+                                    ip: host_target.clone(),
+                                    hostname: String::new(),
+                                    os_info: "Active Directory (Kerberos)".to_owned(),
+                                    domain: realm.clone(),
+                                    signing: None,
+                                    smbv1: None,
+                                    shares: Vec::new(),
+                                    admin: false,
+                                    users: Vec::new(),
+                                    logged_in_cred: cred_label.clone(),
+                                },
+                            )
+                        });
+
+                    if let Some((assessment_id, node)) =
+                        self.workflow.snarl.nodes_ids_mut().find(|(_, node)| {
+                            matches!(node, WorkflowNode::KerberosAssessmentNode {
+                                endpoint: value, ..
+                            } if value == &endpoint)
+                        })
+                    {
+                        if let WorkflowNode::KerberosAssessmentNode {
+                            realm: node_realm,
+                            findings: node_findings,
+                            errors: node_errors,
+                            error: node_error,
+                            cred_label: node_cred_label,
+                            ..
+                        } = node
+                        {
+                            *node_realm = realm;
+                            *node_findings = findings;
+                            *node_errors = errors;
+                            *node_error = error;
+                            *node_cred_label = cred_label;
+                        }
+                        self.selected_workflow_node = Some(assessment_id.0);
+                    } else {
+                        let count = self.workflow.snarl.nodes().count() as f32;
+                        let assessment_id = self.workflow.snarl.insert_node(
+                            egui::Pos2::new(
+                                40.0 + (count % 4.0) * 280.0,
+                                40.0 + (count / 4.0).floor() * 200.0,
+                            ),
+                            WorkflowNode::KerberosAssessmentNode {
+                                endpoint,
+                                realm,
+                                findings,
+                                errors,
+                                error,
+                                cred_label,
+                            },
+                        );
+                        self.workflow.snarl.connect(
+                            egui_snarl::OutPinId {
+                                node: host_id,
+                                output: 0,
+                            },
+                            egui_snarl::InPinId {
+                                node: assessment_id,
+                                input: 0,
+                            },
+                        );
+                        self.selected_workflow_node = Some(assessment_id.0);
+                    }
+                }
                 RuntimeEvent::BloodHoundProgress { endpoint, progress } => {
                     let export = self.bloodhound_exports.entry(endpoint.clone()).or_default();
                     export.running = true;
@@ -1458,6 +1675,7 @@ impl AppState {
         self.credentials = save.credentials;
         self.session_credentials.clear();
         self.bloodhound_exports.clear();
+        self.kerberos_artifacts.clear();
         self.networks = save.networks;
         self.logs = save.logs;
         self.target_config.target = save.target_config.target;
@@ -1737,6 +1955,45 @@ mod user_enum_tests {
         assert!(!serialized.contains("test-only-ldap-secret"));
         assert!(!serialized.contains(&synthetic_nt_hash_hex()));
         assert!(!serialized.contains("\"loading\""));
+    }
+
+    #[test]
+    fn kerberos_results_create_safe_connected_nodes() {
+        let (mut state, _host_id, tx) = state_with_host();
+        tx.send(RuntimeEvent::KerberosResult {
+            endpoint: "127.0.0.1:88".to_owned(),
+            realm: "EXAMPLE.TEST".to_owned(),
+            cred_label: Some("EXAMPLE\\alice".to_owned()),
+            result: Ok(netraze_protocols::kerberos::KerberosAssessmentOutcome {
+                findings: vec![netraze_core::KerberosFinding {
+                    kind: netraze_core::KerberosFindingKind::AsRepRoast,
+                    principal: "roastable".to_owned(),
+                    service_principal_name: None,
+                    encryption_type: 23,
+                    hashcat_mode: 18_200,
+                }],
+                artifacts: Vec::new(),
+                errors: Vec::new(),
+            }),
+        })
+        .unwrap();
+        state.poll_logs();
+
+        assert!(state.workflow.snarl.nodes().any(|node| matches!(
+            node,
+            WorkflowNode::KerberosAssessmentNode {
+                endpoint,
+                realm,
+                findings,
+                error: None,
+                ..
+            } if endpoint == "127.0.0.1:88"
+                && realm == "EXAMPLE.TEST"
+                && findings.len() == 1
+        )));
+        let workspace = serde_json::to_string(&state.to_save()).unwrap();
+        assert!(workspace.contains("roastable"));
+        assert!(!workspace.contains("krb5asrep"));
     }
 
     #[test]

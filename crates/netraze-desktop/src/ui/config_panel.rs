@@ -98,6 +98,21 @@ fn show_default_config(ui: &mut egui::Ui, state: &mut AppState, runtime: &Runtim
     );
     ui.add_space(2.0);
 
+    if state.target_config.protocol == "Kerberos" {
+        ui.label(
+            egui::RichText::new("AES Key (hex)")
+                .small()
+                .color(LABEL_COLOR),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut state.credential_config.kerberos_aes_key)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace)
+                .password(true),
+        );
+        ui.add_space(2.0);
+    }
+
     ui.label(
         egui::RichText::new("Kerberos Ticket")
             .small()
@@ -128,6 +143,83 @@ fn show_default_config(ui: &mut egui::Ui, state: &mut AppState, runtime: &Runtim
         ui.label(
             egui::RichText::new(
                 "To force anonymous on a logged-in host, select Login As (anonymous) for that host. DOMAIN\\Guest with no secret attempts Guest NTLM; the server may reject it.",
+            )
+            .small()
+            .color(LABEL_COLOR),
+        );
+    }
+    if state.target_config.protocol == "Kerberos" {
+        ui.label(
+            egui::RichText::new(
+                "Use DOMAIN\\username. Enter exactly one password, NT hash, or AES key; blank fields reuse the target's current Login As credential.",
+            )
+            .small()
+            .color(LABEL_COLOR),
+        );
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new("KERBEROS ASSESSMENT")
+                .small()
+                .strong()
+                .color(ACCENT),
+        );
+        ui.label(egui::RichText::new("Realm").small().color(LABEL_COLOR));
+        ui.add(
+            egui::TextEdit::singleline(&mut state.kerberos_config.realm)
+                .hint_text("EXAMPLE.TEST (optional with LDAP/domain)")
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        );
+        ui.label(
+            egui::RichText::new("KDC override")
+                .small()
+                .color(LABEL_COLOR),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut state.kerberos_config.kdc_override)
+                .hint_text("host:88 (optional)")
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        );
+        ui.checkbox(
+            &mut state.kerberos_config.assess_as_rep,
+            "Assess accounts without pre-authentication",
+        );
+        ui.checkbox(
+            &mut state.kerberos_config.assess_spns,
+            "Request service tickets for user service accounts",
+        );
+        ui.checkbox(
+            &mut state.kerberos_config.use_ldap_discovery,
+            "Discover candidates from LDAP inventory",
+        );
+        ui.label(
+            egui::RichText::new("Explicit AS-REP principals")
+                .small()
+                .color(LABEL_COLOR),
+        );
+        ui.add(
+            egui::TextEdit::multiline(&mut state.kerberos_config.explicit_principals)
+                .hint_text("user1, user2")
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        );
+        ui.label(
+            egui::RichText::new("Explicit service principals")
+                .small()
+                .color(LABEL_COLOR),
+        );
+        ui.add(
+            egui::TextEdit::multiline(&mut state.kerberos_config.explicit_spns)
+                .hint_text("account=HTTP/server.example.test")
+                .desired_rows(2)
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Only safe finding metadata is saved in the workspace. Ticket-derived Hashcat lines remain in memory until you explicitly export them.",
             )
             .small()
             .color(LABEL_COLOR),
@@ -251,6 +343,64 @@ fn show_default_config(ui: &mut egui::Ui, state: &mut AppState, runtime: &Runtim
                     runtime.emit_error(error);
                 }
             },
+            "Kerberos" => match state.credential_config.as_kerberos_record() {
+                Ok(mut record) => {
+                    if let Some(credential) = &mut record {
+                        credential.protocol = "Kerberos".to_owned();
+                    }
+                    if let Some(credential) = &record {
+                        state.remember_scan_credential(credential.clone());
+                    }
+                    let plan = state.scan_credential_plan(record);
+                    let inventories = state
+                        .workflow
+                        .snarl
+                        .nodes()
+                        .filter_map(|node| {
+                            if let WorkflowNode::DirectoryNode {
+                                endpoint,
+                                inventory: Some(inventory),
+                                ..
+                            } = node
+                            {
+                                Some((
+                                    netraze_protocols::targets::endpoint_host(endpoint)
+                                        .to_ascii_lowercase(),
+                                    inventory.as_ref().clone(),
+                                ))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    let options = crate::runtime::KerberosScanOptions {
+                        realm: nonempty(&state.kerberos_config.realm),
+                        kdc_override: nonempty(&state.kerberos_config.kdc_override),
+                        assess_as_rep: state.kerberos_config.assess_as_rep,
+                        assess_spns: state.kerberos_config.assess_spns,
+                        use_ldap_discovery: state.kerberos_config.use_ldap_discovery,
+                        explicit_principals: parse_principals(
+                            &state.kerberos_config.explicit_principals,
+                        ),
+                        explicit_spns: match parse_spns(&state.kerberos_config.explicit_spns) {
+                            Ok(targets) => targets,
+                            Err(error) => {
+                                state.is_running = false;
+                                state.status_text = "Idle".to_owned();
+                                runtime.emit_error(error);
+                                return;
+                            }
+                        },
+                        inventories,
+                    };
+                    runtime.spawn_kerberos_scan(targets, plan, options, state.timeout_seconds);
+                }
+                Err(error) => {
+                    state.is_running = false;
+                    state.status_text = "Idle".to_owned();
+                    runtime.emit_error(error);
+                }
+            },
             protocol => {
                 state.is_running = false;
                 state.status_text = "Idle".to_owned();
@@ -290,8 +440,89 @@ fn scan_validation_error(state: &AppState) -> Option<String> {
                 .map_err(|error| format!("Invalid LDAP credential: {error}"))
                 .err()
         }
+        "Kerberos" => {
+            if !state.kerberos_config.assess_as_rep && !state.kerberos_config.assess_spns {
+                return Some("Select at least one Kerberos assessment".to_owned());
+            }
+            if !state.kerberos_config.kdc_override.trim().is_empty()
+                && state
+                    .target_config
+                    .target
+                    .split([',', ' ', '\n'])
+                    .filter(|value| !value.trim().is_empty())
+                    .count()
+                    > 1
+            {
+                return Some("A KDC override can only be used with one target".to_owned());
+            }
+            if let Err(error) = parse_spns(&state.kerberos_config.explicit_spns) {
+                return Some(error);
+            }
+            state.credential_config.as_kerberos_record().err()
+        }
         protocol => Some(format!(
             "Protocol {protocol} does not have a desktop scan workflow yet"
+        )),
+    }
+}
+
+fn nonempty(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+fn parse_principals(value: &str) -> Vec<String> {
+    value
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn parse_spns(
+    value: &str,
+) -> Result<Vec<netraze_protocols::kerberos::ServicePrincipalTarget>, String> {
+    value
+        .split([',', '\n'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let (account, spn) = value.split_once('=').ok_or_else(|| {
+                format!("Service principal `{value}` must use ACCOUNT=service/host format")
+            })?;
+            netraze_protocols::kerberos::ServicePrincipalTarget::new(account.trim(), spn.trim())
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+fn export_kerberos_artifacts(state: &mut AppState, runtime: &RuntimeServices, endpoint: &str) {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("Export Kerberos Hashcat material")
+        .set_file_name("netraze-kerberos-hashes.txt")
+        .save_file()
+    else {
+        return;
+    };
+    let Some(artifacts) = state.kerberos_artifacts.get(endpoint) else {
+        runtime.emit_error(
+            "Kerberos artifact material is no longer available; run the assessment again",
+        );
+        return;
+    };
+    match netraze_protocols::kerberos::export_roast_artifacts(&path, artifacts) {
+        Ok(()) => runtime.emit_log(
+            crate::runtime::LogLevel::Success,
+            format!(
+                "{endpoint}: exported {} Kerberos artifact(s) to {}",
+                artifacts.len(),
+                path.display()
+            ),
+        ),
+        Err(error) => runtime.emit_error(format!(
+            "{endpoint}: Kerberos artifact export failed for {}: {error}",
+            path.display()
         )),
     }
 }
@@ -305,6 +536,38 @@ fn show_node_panel(
     raw_id: usize,
 ) {
     let node_id = NodeId(raw_id);
+
+    if let WorkflowNode::KerberosAssessmentNode {
+        endpoint,
+        realm,
+        findings,
+        errors,
+        error,
+        cred_label,
+    } = &state.workflow.snarl[node_id]
+    {
+        let artifacts_available = state
+            .kerberos_artifacts
+            .get(endpoint)
+            .is_some_and(|artifacts| !artifacts.is_empty());
+        let action = super::kerberos_panel::show(
+            ui,
+            super::kerberos_panel::KerberosView {
+                endpoint,
+                realm,
+                findings,
+                errors,
+                error: error.as_deref(),
+                cred_label: cred_label.as_deref(),
+                artifacts_available,
+            },
+        );
+        let endpoint = endpoint.clone();
+        if action == super::kerberos_panel::KerberosAction::ExportHashcat {
+            export_kerberos_artifacts(state, runtime, &endpoint);
+        }
+        return;
+    }
 
     if let WorkflowNode::DirectoryNode {
         endpoint,
@@ -458,6 +721,9 @@ fn show_node_panel(
         WorkflowNode::UsersNode { .. } => unreachable!("users are rendered by reference above"),
         WorkflowNode::DirectoryNode { .. } => {
             unreachable!("directory inventories are rendered by reference above")
+        }
+        WorkflowNode::KerberosAssessmentNode { .. } => {
+            unreachable!("Kerberos assessments are rendered by reference above")
         }
         WorkflowNode::DumpNode {
             host_ip,
@@ -1159,5 +1425,33 @@ mod tests {
             scan_validation_error(&state)
                 .is_some_and(|error| error.starts_with("NT hash must be 32 hex chars"))
         );
+    }
+
+    #[test]
+    fn kerberos_validation_accepts_explicit_as_rep_without_a_secret() {
+        let mut state = ldap_state();
+        state.target_config.protocol = "Kerberos".to_owned();
+        state.kerberos_config.use_ldap_discovery = false;
+        state.kerberos_config.assess_spns = false;
+        state.kerberos_config.realm = "EXAMPLE.TEST".to_owned();
+        state.kerberos_config.explicit_principals = "alice, bob".to_owned();
+        assert!(scan_validation_error(&state).is_none());
+        assert_eq!(parse_principals("alice, bob\ncarol").len(), 3);
+    }
+
+    #[test]
+    fn kerberos_validation_rejects_ambiguous_secrets_and_malformed_spns() {
+        let mut state = ldap_state();
+        state.target_config.protocol = "Kerberos".to_owned();
+        state.credential_config.username = "EXAMPLE\\alice".to_owned();
+        state.credential_config.password = "test-only-password".to_owned();
+        state.credential_config.ntlm_hash = (0_u8..16).map(|byte| format!("{byte:02x}")).collect();
+        assert!(scan_validation_error(&state).is_some());
+
+        state.credential_config.password.clear();
+        state.kerberos_config.explicit_spns = "missing-separator".to_owned();
+        assert!(scan_validation_error(&state).is_some());
+        state.kerberos_config.explicit_spns = "svc=HTTP/web.example.test".to_owned();
+        assert!(scan_validation_error(&state).is_none());
     }
 }

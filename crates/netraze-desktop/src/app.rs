@@ -99,10 +99,20 @@ impl eframe::App for NetRazeDesktopApp {
                 let host = browser.host_ip.clone();
                 let share = browser.share_name.clone();
                 let rel_path = browser.current_rel_path();
-                let cred = browser
+                let cred = match browser
                     .credential
-                    .clone()
-                    .map(|c| crate::runtime::cred_to_smb(&c));
+                    .as_ref()
+                    .map(crate::runtime::cred_to_smb)
+                    .transpose()
+                {
+                    Ok(credential) => credential,
+                    Err(error) => {
+                        browser.loading = false;
+                        browser.error = Some(error.clone());
+                        self.runtime.emit_error(error);
+                        continue;
+                    }
+                };
                 self.runtime
                     .spawn_browse_directory(browser_id, host, share, rel_path, cred);
             }
@@ -151,10 +161,18 @@ impl eframe::App for NetRazeDesktopApp {
             };
             let host = browser.host_ip.clone();
             let share = browser.share_name.clone();
-            let cred = browser
+            let cred = match browser
                 .credential
-                .clone()
-                .map(|c| crate::runtime::cred_to_smb(&c));
+                .as_ref()
+                .map(crate::runtime::cred_to_smb)
+                .transpose()
+            {
+                Ok(credential) => credential,
+                Err(error) => {
+                    self.runtime.emit_error(error);
+                    continue;
+                }
+            };
             match action {
                 ui::share_browser::BrowserAction::Navigate => {
                     // path_stack was already updated by the window — re-list.

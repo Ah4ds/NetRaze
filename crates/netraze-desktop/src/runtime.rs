@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::runtime::{Builder, Runtime};
 use tokio::sync::mpsc::UnboundedSender;
@@ -83,6 +84,12 @@ pub enum RuntimeEvent {
         cred_label: String,
         result: Box<Result<netraze_core::DirectoryInventory, String>>,
     },
+    KerberosResult {
+        endpoint: String,
+        realm: String,
+        cred_label: Option<String>,
+        result: Result<netraze_protocols::kerberos::KerberosAssessmentOutcome, String>,
+    },
     BloodHoundProgress {
         endpoint: String,
         progress: netraze_protocols::ldap::BloodHoundCeProgress,
@@ -124,6 +131,18 @@ pub enum RuntimeEvent {
 
 // Keep backward compat alias
 pub type RuntimeLogEvent = RuntimeEvent;
+
+#[derive(Debug, Clone)]
+pub struct KerberosScanOptions {
+    pub realm: Option<String>,
+    pub kdc_override: Option<String>,
+    pub assess_as_rep: bool,
+    pub assess_spns: bool,
+    pub use_ldap_discovery: bool,
+    pub explicit_principals: Vec<String>,
+    pub explicit_spns: Vec<netraze_protocols::kerberos::ServicePrincipalTarget>,
+    pub inventories: HashMap<String, netraze_core::DirectoryInventory>,
+}
 
 #[derive(Debug)]
 pub struct RuntimeServices {
@@ -299,7 +318,37 @@ impl RuntimeServices {
                     .unwrap_or_else(|| "(anonymous)".to_owned());
                 let mut client = SmbClient::new(target);
                 if let Some(ref cred) = credential {
-                    client = client.with_credential(cred_to_smb(cred));
+                    match cred_to_smb(cred) {
+                        Ok(smb_credential) => {
+                            client = client.with_credential(smb_credential);
+                        }
+                        Err(error) => {
+                            let _ = tx.send(RuntimeEvent::Log {
+                                level: LogLevel::Error,
+                                message: format!("{target}: SMB scan skipped: {error}"),
+                            });
+                            let _ = tx.send(RuntimeEvent::SmbResult {
+                                result: Box::new(SmbScanResult {
+                                    target: target.clone(),
+                                    hostname: None,
+                                    os_info: None,
+                                    signing: None,
+                                    smb_version: None,
+                                    shares: Vec::new(),
+                                    users: Vec::new(),
+                                    admin: false,
+                                    error: Some(error),
+                                }),
+                                credential_label: Some(credential_label),
+                            });
+                            step += 5;
+                            let _ = tx.send(RuntimeEvent::ScanProgress {
+                                done: step,
+                                total: total_steps,
+                            });
+                            continue;
+                        }
+                    }
                 }
 
                 // Step 0: Fingerprint (no auth needed)
@@ -634,6 +683,109 @@ impl RuntimeServices {
         });
     }
 
+    /// Run bounded Kerberos exposure checks against each selected KDC. LDAP
+    /// inventory is reused from the workflow when available and otherwise
+    /// collected with the same selected password/NT-hash credential.
+    pub fn spawn_kerberos_scan(
+        &self,
+        raw_targets: Vec<String>,
+        credential_plan: ScanCredentialPlan,
+        options: KerberosScanOptions,
+        timeout_seconds: u64,
+    ) {
+        let tx = self.log_tx.clone();
+        self.runtime.spawn(async move {
+            let target_label = raw_targets.join(", ");
+            let _ = tx.send(RuntimeEvent::ScanStarted { target_label });
+            let targets = raw_targets
+                .iter()
+                .flat_map(|target| parse_target_list(target))
+                .collect::<Vec<_>>();
+            let total = targets.len();
+            if total == 0 {
+                let _ = tx.send(RuntimeEvent::Log {
+                    level: LogLevel::Error,
+                    message: "No valid Kerberos target was supplied".to_owned(),
+                });
+                let _ = tx.send(RuntimeEvent::ScanFinished);
+                return;
+            }
+
+            for (index, target) in targets.iter().enumerate() {
+                let endpoint = options.kdc_override.as_deref().map_or_else(
+                    || netraze_protocols::targets::with_default_port(target, 88),
+                    |override_endpoint| {
+                        netraze_protocols::targets::with_default_port(override_endpoint, 88)
+                    },
+                );
+                let credential = match credential_plan.for_target(target) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = tx.send(RuntimeEvent::Log {
+                            level: LogLevel::Error,
+                            message: format!("{endpoint}: Kerberos scan skipped: {error}"),
+                        });
+                        let _ = tx.send(RuntimeEvent::KerberosResult {
+                            endpoint,
+                            realm: options.realm.clone().unwrap_or_default(),
+                            cred_label: None,
+                            result: Err(error),
+                        });
+                        let _ = tx.send(RuntimeEvent::ScanProgress {
+                            done: index + 1,
+                            total,
+                        });
+                        continue;
+                    }
+                };
+                let label = credential.as_ref().map(crate::state::cred_label);
+                let result = run_kerberos_assessment(
+                    target,
+                    &endpoint,
+                    credential.as_ref(),
+                    &options,
+                    Duration::from_secs(timeout_seconds.max(1)),
+                )
+                .await;
+                let (realm, result) = match result {
+                    Ok((realm, outcome)) => (realm, Ok(outcome)),
+                    Err(error) => (
+                        options.realm.clone().unwrap_or_default(),
+                        Err(credential.as_ref().map_or(error.clone(), |value| {
+                            redact_secret(&error, &value.secret)
+                        })),
+                    ),
+                };
+                let (level, message) = match &result {
+                    Ok(outcome) => (
+                        LogLevel::Success,
+                        format!(
+                            "{endpoint}: Kerberos assessment completed ({} findings, {} target errors)",
+                            outcome.findings.len(),
+                            outcome.errors.len()
+                        ),
+                    ),
+                    Err(error) => (
+                        LogLevel::Error,
+                        format!("{endpoint}: Kerberos assessment failed: {error}"),
+                    ),
+                };
+                let _ = tx.send(RuntimeEvent::Log { level, message });
+                let _ = tx.send(RuntimeEvent::KerberosResult {
+                    endpoint,
+                    realm,
+                    cred_label: label,
+                    result,
+                });
+                let _ = tx.send(RuntimeEvent::ScanProgress {
+                    done: index + 1,
+                    total,
+                });
+            }
+            let _ = tx.send(RuntimeEvent::ScanFinished);
+        });
+    }
+
     /// Collect a fresh LDAP graph and export BloodHound Community Edition data.
     pub fn spawn_bloodhound_ce_export(
         &self,
@@ -765,6 +917,19 @@ impl RuntimeServices {
                     }
                 }
                 crate::state::CredType::Password => SmbCredential::new(&username, &domain, &secret),
+                crate::state::CredType::Aes128Key | crate::state::CredType::Aes256Key => {
+                    let _ = tx.send(RuntimeEvent::Log {
+                        level: LogLevel::Error,
+                        message: format!("{ip}: Kerberos AES keys cannot authenticate SMB"),
+                    });
+                    let _ = tx.send(RuntimeEvent::LoginResult {
+                        ip,
+                        cred_label: cred_label_clone,
+                        success: false,
+                        admin: false,
+                    });
+                    return;
+                }
             };
             let mut client = SmbClient::new(&ip).with_credential(smb_cred);
             let login_result = client.connect().await;
@@ -824,7 +989,20 @@ impl RuntimeServices {
 
         let ip_clone = ip.clone();
         let hostname_clone = hostname.clone();
-        let smb_cred = cred_to_smb(&cred);
+        let smb_cred = match cred_to_smb(&cred) {
+            Ok(credential) => credential,
+            Err(error) => {
+                let _ = tx.send(RuntimeEvent::ShareEnumResult {
+                    host_node_id,
+                    ip,
+                    hostname,
+                    shares: Vec::new(),
+                    error: Some(error),
+                    cred_label: Some(crate::state::cred_label(&cred)),
+                });
+                return;
+            }
+        };
         // Same label format as spawn_login_attempt — resolve_cred matches on it.
         let cred_label = crate::state::cred_label(&cred);
         self.runtime.spawn(async move {
@@ -894,7 +1072,18 @@ impl RuntimeServices {
 
         let ip_clone = ip.clone();
         let hostname_clone = hostname.clone();
-        let smb_cred = cred_to_smb(&cred);
+        let smb_cred = match cred_to_smb(&cred) {
+            Ok(credential) => credential,
+            Err(error) => {
+                let _ = tx.send(RuntimeEvent::UserEnumResult {
+                    host_node_id,
+                    ip,
+                    hostname,
+                    result: Err(error),
+                });
+                return;
+            }
+        };
         self.runtime.spawn(async move {
             // Keep an explicitly typed SMB port (e.g. a container harness on
             // :1445); the common dispatcher derives port 389 for LDAP and
@@ -955,7 +1144,20 @@ impl RuntimeServices {
 
         let ip2 = ip.clone();
         let hostname2 = hostname.clone();
-        let smb_cred = cred_to_smb(&cred);
+        let smb_cred = match cred_to_smb(&cred) {
+            Ok(credential) => credential,
+            Err(error) => {
+                let _ = tx.send(RuntimeEvent::DumpResult {
+                    host_node_id,
+                    ip,
+                    hostname,
+                    dump_type: "SAM".to_owned(),
+                    entries: Vec::new(),
+                    error: Some(error),
+                });
+                return;
+            }
+        };
         self.runtime.spawn(async move {
             let result = remote_dump_sam(&ip2, &smb_cred).await;
 
@@ -1008,7 +1210,20 @@ impl RuntimeServices {
 
         let ip2 = ip.clone();
         let hostname2 = hostname.clone();
-        let smb_cred = cred_to_smb(&cred);
+        let smb_cred = match cred_to_smb(&cred) {
+            Ok(credential) => credential,
+            Err(error) => {
+                let _ = tx.send(RuntimeEvent::DumpResult {
+                    host_node_id,
+                    ip,
+                    hostname,
+                    dump_type: "LSA".to_owned(),
+                    entries: Vec::new(),
+                    error: Some(error),
+                });
+                return;
+            }
+        };
         self.runtime.spawn(async move {
             let result = remote_dump_lsa(&ip2, &smb_cred).await;
 
@@ -1061,7 +1276,20 @@ impl RuntimeServices {
 
         let ip2 = ip.clone();
         let hostname2 = hostname.clone();
-        let smb_cred = cred_to_smb(&cred);
+        let smb_cred = match cred_to_smb(&cred) {
+            Ok(credential) => credential,
+            Err(error) => {
+                let _ = tx.send(RuntimeEvent::DumpResult {
+                    host_node_id,
+                    ip,
+                    hostname,
+                    dump_type: "NANODUMP".to_owned(),
+                    entries: Vec::new(),
+                    error: Some(error),
+                });
+                return;
+            }
+        };
         self.runtime.spawn(async move {
             let binary_bytes = match std::fs::read(&binary_path) {
                 Ok(b) => b,
@@ -1165,7 +1393,19 @@ impl RuntimeServices {
 
         let ip2 = ip.clone();
         let hostname2 = hostname.clone();
-        let smb_cred = cred_to_smb(&cred);
+        let smb_cred = match cred_to_smb(&cred) {
+            Ok(credential) => credential,
+            Err(error) => {
+                let _ = tx.send(RuntimeEvent::EnumAvResult {
+                    host_node_id,
+                    ip,
+                    hostname,
+                    products: Vec::new(),
+                    error: Some(error),
+                });
+                return;
+            }
+        };
         self.runtime.spawn(async move {
             // The portable backend is async — await it directly.
             let av_result = enum_av(&ip2, Some(&smb_cred)).await;
@@ -1470,6 +1710,10 @@ impl RuntimeServices {
                     let cred = SmbCredential::new(&username, &domain, &secret);
                     execute_command_live(&ip, Some(&cred), &command, &logger).await
                 }
+                crate::state::CredType::Aes128Key | crate::state::CredType::Aes256Key => (
+                    Err("Kerberos AES keys cannot authenticate SMB".to_owned()),
+                    Vec::new(),
+                ),
             };
 
             match result {
@@ -1502,29 +1746,197 @@ impl RuntimeServices {
     }
 }
 
-/// Convert a desktop `CredentialRecord` into an `SmbCredential` usable by
-/// the protocol layer.
-pub(crate) fn cred_to_smb(cred: &crate::state::CredentialRecord) -> SmbCredential {
-    match cred.cred_type {
-        crate::state::CredType::Password => {
-            SmbCredential::new(&cred.username, &cred.domain, &cred.secret)
-        }
-        crate::state::CredType::Hash => {
-            let mut hash = [0u8; 16];
-            let hex = cred.secret.trim();
-            if hex.len() == 32 {
-                for i in 0..16 {
-                    if let Ok(b) = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16) {
-                        hash[i] = b;
+async fn run_kerberos_assessment(
+    target: &str,
+    endpoint: &str,
+    credential: Option<&CredentialRecord>,
+    options: &KerberosScanOptions,
+    timeout: Duration,
+) -> Result<
+    (
+        String,
+        netraze_protocols::kerberos::KerberosAssessmentOutcome,
+    ),
+    String,
+> {
+    use netraze_core::KerberosTargetError;
+    use netraze_protocols::kerberos::{
+        KerberosAssessmentTargets, KerberosClient, KerberosClientConfig, targets_from_inventory,
+    };
+
+    let host_key = netraze_protocols::targets::endpoint_host(target).to_ascii_lowercase();
+    let mut outcome = netraze_protocols::kerberos::KerberosAssessmentOutcome::default();
+    let mut inventory = options.inventories.get(&host_key).cloned();
+
+    if options.use_ldap_discovery && inventory.is_none() {
+        if let Some(credential) = credential {
+            match cred_to_ldap_auth(credential) {
+                Ok(authentication) => {
+                    let ldap_endpoint = netraze_protocols::targets::with_default_port(target, 389);
+                    let mut config = netraze_protocols::ldap::LdapClientConfig::new(&ldap_endpoint);
+                    config.connect_timeout = timeout;
+                    config.operation_timeout = timeout;
+                    match netraze_protocols::ldap::inventory_with_authentication(
+                        config,
+                        authentication,
+                    )
+                    .await
+                    {
+                        Ok(value) => inventory = Some(value),
+                        Err(error) => outcome.errors.push(KerberosTargetError {
+                            target: ldap_endpoint,
+                            message: redact_secret(&error.to_string(), &credential.secret),
+                        }),
                     }
                 }
+                Err(error) => outcome.errors.push(KerberosTargetError {
+                    target: "LDAP discovery".to_owned(),
+                    message: error,
+                }),
             }
-            SmbCredential {
-                username: cred.username.clone(),
-                domain: cred.domain.clone(),
-                password: String::new(),
-                nt_hash: Some(hash),
+        } else {
+            outcome.errors.push(KerberosTargetError {
+                target: "LDAP discovery".to_owned(),
+                message: "no selected credential is available for directory discovery".to_owned(),
+            });
+        }
+    }
+
+    let realm = options
+        .realm
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| value.trim().to_ascii_uppercase())
+        .or_else(|| inventory.as_ref().and_then(realm_from_inventory))
+        .or_else(|| {
+            credential
+                .map(|value| value.domain.trim())
+                .filter(|value| !value.is_empty())
+                .map(str::to_ascii_uppercase)
+        })
+        .ok_or_else(|| {
+            "Kerberos realm is required when it cannot be derived from LDAP or the credential domain"
+                .to_owned()
+        })?;
+
+    let mut targets = KerberosAssessmentTargets {
+        as_rep_principals: options.explicit_principals.clone(),
+        service_principals: options.explicit_spns.clone(),
+    };
+    if let Some(inventory) = &inventory {
+        let discovered = targets_from_inventory(inventory);
+        targets
+            .as_rep_principals
+            .extend(discovered.as_rep_principals);
+        targets
+            .service_principals
+            .extend(discovered.service_principals);
+    }
+    targets.normalize().map_err(|error| error.to_string())?;
+
+    let mut config = KerberosClientConfig::new(endpoint, &realm);
+    config.connect_timeout = timeout;
+    config.operation_timeout = timeout;
+    let client = KerberosClient::connect(config).map_err(|error| error.to_string())?;
+
+    if options.assess_as_rep && !targets.as_rep_principals.is_empty() {
+        let assessed = client
+            .assess_as_rep(&targets.as_rep_principals)
+            .await
+            .map_err(|error| error.to_string())?;
+        outcome.merge(assessed);
+    }
+
+    if options.assess_spns && !targets.service_principals.is_empty() {
+        if let Some(credential_record) = credential {
+            match cred_to_kerberos(credential_record) {
+                Ok(kerberos_credential) => match client
+                    .request_tgt(&credential_record.username, &kerberos_credential)
+                    .await
+                {
+                    Ok(tgt) => {
+                        let assessed = client
+                            .assess_spns(&tgt, &targets.service_principals)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                        outcome.merge(assessed);
+                    }
+                    Err(error) => outcome.errors.push(KerberosTargetError {
+                        target: credential_record.username.clone(),
+                        message: redact_secret(&error.to_string(), &credential_record.secret),
+                    }),
+                },
+                Err(error) => outcome.errors.push(KerberosTargetError {
+                    target: "Kerberoast authentication".to_owned(),
+                    message: error,
+                }),
             }
+        } else {
+            outcome.errors.push(KerberosTargetError {
+                target: "Kerberoast authentication".to_owned(),
+                message: "a password, NT hash, or AES key is required".to_owned(),
+            });
+        }
+    }
+
+    Ok((realm, outcome))
+}
+
+pub(crate) fn realm_from_inventory(inventory: &netraze_core::DirectoryInventory) -> Option<String> {
+    let labels = inventory
+        .server
+        .default_naming_context
+        .split(',')
+        .filter_map(|rdn| {
+            rdn.trim()
+                .strip_prefix("DC=")
+                .or_else(|| rdn.trim().strip_prefix("dc="))
+        })
+        .filter(|label| !label.is_empty())
+        .collect::<Vec<_>>();
+    (!labels.is_empty()).then(|| labels.join(".").to_ascii_uppercase())
+}
+
+pub(crate) fn cred_to_kerberos(
+    cred: &crate::state::CredentialRecord,
+) -> Result<netraze_protocols::kerberos::KerberosCredential, String> {
+    use crate::state::CredType;
+    use netraze_protocols::kerberos::KerberosCredential;
+
+    if cred.username.trim().is_empty() {
+        return Err("Kerberos authentication requires a username".to_owned());
+    }
+    if cred.secret.is_empty() {
+        return Err("Kerberos authentication requires a password, NT hash, or AES key".to_owned());
+    }
+    match cred.cred_type {
+        CredType::Password => Ok(KerberosCredential::Password(cred.secret.clone())),
+        CredType::Hash => {
+            KerberosCredential::from_nt_hash_hex(&cred.secret).map_err(|error| error.to_string())
+        }
+        CredType::Aes128Key => {
+            KerberosCredential::from_aes128_hex(&cred.secret).map_err(|error| error.to_string())
+        }
+        CredType::Aes256Key => {
+            KerberosCredential::from_aes256_hex(&cred.secret).map_err(|error| error.to_string())
+        }
+    }
+}
+
+/// Convert a desktop `CredentialRecord` into an `SmbCredential` usable by
+/// the protocol layer.
+pub(crate) fn cred_to_smb(cred: &crate::state::CredentialRecord) -> Result<SmbCredential, String> {
+    match cred.cred_type {
+        crate::state::CredType::Password => Ok(SmbCredential::new(
+            &cred.username,
+            &cred.domain,
+            &cred.secret,
+        )),
+        crate::state::CredType::Hash => {
+            SmbCredential::with_hash(&cred.username, &cred.domain, &cred.secret)
+        }
+        crate::state::CredType::Aes128Key | crate::state::CredType::Aes256Key => {
+            Err("Kerberos AES keys cannot authenticate SMB".to_owned())
         }
     }
 }
@@ -1545,6 +1957,9 @@ pub(crate) fn cred_to_ntlm(
         crate::state::CredType::Hash => {
             netraze_protocols::ntlm::NtlmCredential::from_nt_hash_hex(&cred.secret)
                 .map_err(|error| error.to_string())
+        }
+        crate::state::CredType::Aes128Key | crate::state::CredType::Aes256Key => {
+            Err("LDAP NTLM authentication does not accept Kerberos AES keys".to_owned())
         }
     }
 }
@@ -1635,6 +2050,35 @@ mod ldap_runtime_tests {
             ..valid_hash
         };
         assert!(cred_to_ntlm(&invalid_hash).is_err());
+    }
+
+    #[test]
+    fn converts_kerberos_aes_keys_without_accepting_them_for_smb_or_ldap() {
+        let credential = CredentialRecord {
+            username: "alice".to_owned(),
+            domain: "EXAMPLE.TEST".to_owned(),
+            secret: "11".repeat(32),
+            cred_type: CredType::Aes256Key,
+            ..anonymous_record()
+        };
+        assert!(matches!(
+            cred_to_kerberos(&credential),
+            Ok(netraze_protocols::kerberos::KerberosCredential::Aes256Key(
+                _
+            ))
+        ));
+        assert!(cred_to_smb(&credential).is_err());
+        assert!(cred_to_ldap_auth(&credential).is_err());
+    }
+
+    #[test]
+    fn derives_uppercase_realm_from_default_naming_context() {
+        let mut inventory = netraze_core::DirectoryInventory::default();
+        inventory.server.default_naming_context = "DC=example,DC=test".to_owned();
+        assert_eq!(
+            realm_from_inventory(&inventory).as_deref(),
+            Some("EXAMPLE.TEST")
+        );
     }
 
     #[test]

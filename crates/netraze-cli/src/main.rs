@@ -645,26 +645,7 @@ fn report_kerberos_outcome(outcome: &KerberosAssessmentOutcome) {
 }
 
 fn export_roast_artifacts(path: &Path, artifacts: &[RoastArtifact]) -> Result<()> {
-    use std::io::Write;
-
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|error| anyhow::anyhow!("cannot create {}: {error}", path.display()))?;
-    #[cfg(unix)]
-    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
-        .map_err(|error| anyhow::anyhow!("cannot protect {}: {error}", path.display()))?;
-    for artifact in artifacts {
-        writeln!(file, "{}", artifact.hashcat_line())
-            .map_err(|error| anyhow::anyhow!("cannot write {}: {error}", path.display()))?;
-    }
-    file.flush()
+    netraze_protocols::kerberos::export_roast_artifacts(path, artifacts)
         .map_err(|error| anyhow::anyhow!("cannot flush {}: {error}", path.display()))?;
     Ok(())
 }

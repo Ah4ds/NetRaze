@@ -1,6 +1,8 @@
 //! AS-REP and service-ticket assessment built on the bounded KDC client.
 
 use std::collections::HashSet;
+use std::io::{self, Write};
+use std::path::Path;
 
 use netraze_core::{
     DirectoryInventory, DirectoryPrincipalKind, KerberosFinding, KerberosFindingKind,
@@ -188,6 +190,27 @@ impl RoastArtifact {
     pub fn into_hashcat_line(self) -> String {
         self.hashcat_line
     }
+}
+
+/// Write explicitly requested Hashcat material to a newly truncated file.
+/// Unix permissions are forced to owner-read/write because these lines are
+/// credential-equivalent. Callers decide the path; assessments never export
+/// artifacts implicitly.
+pub fn export_roast_artifacts(path: &Path, artifacts: &[RoastArtifact]) -> io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    for artifact in artifacts {
+        writeln!(file, "{}", artifact.hashcat_line())?;
+    }
+    file.flush()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -780,6 +803,29 @@ mod tests {
         assert!(debug.contains("REDACTED"));
         let serialized = serde_json::to_string(&artifact.finding).unwrap();
         assert!(!serialized.contains("414141"));
+    }
+
+    #[test]
+    fn explicit_export_writes_artifacts_with_private_permissions() {
+        let ticket = ticket_with_cipher(23, vec![0x41; 40]);
+        let artifact = format_tgs_artifact("svc", "HTTP/web", "EXAMPLE.TEST", &ticket).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "netraze-kerberos-export-{}-{}.txt",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        export_roast_artifacts(&path, &[artifact.clone()]).unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written.trim(), artifact.hashcat_line());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

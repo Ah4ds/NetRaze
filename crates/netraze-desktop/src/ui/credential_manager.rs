@@ -44,7 +44,12 @@ pub fn show(ui: &mut Ui, ctx: &egui::Context, state: &mut AppState) {
     let hash_count = state
         .credentials
         .iter()
-        .filter(|c| matches!(c.cred_type, CredType::Hash))
+        .filter(|c| {
+            matches!(
+                c.cred_type,
+                CredType::Hash | CredType::Aes128Key | CredType::Aes256Key
+            )
+        })
         .count();
 
     ui.add_space(12.0);
@@ -205,6 +210,8 @@ pub fn show(ui: &mut Ui, ctx: &egui::Context, state: &mut AppState) {
                 None => "All types",
                 Some(CredType::Password) => "Password",
                 Some(CredType::Hash) => "Hash",
+                Some(CredType::Aes128Key) => "AES-128",
+                Some(CredType::Aes256Key) => "AES-256",
             })
             .show_ui(ui, |ui| {
                 ui.selectable_value(&mut state.cm_state.filter_type, None, "All types");
@@ -216,7 +223,17 @@ pub fn show(ui: &mut Ui, ctx: &egui::Context, state: &mut AppState) {
                 ui.selectable_value(
                     &mut state.cm_state.filter_type,
                     Some(CredType::Hash),
-                    "Hash",
+                    "NT hash",
+                );
+                ui.selectable_value(
+                    &mut state.cm_state.filter_type,
+                    Some(CredType::Aes128Key),
+                    "AES-128",
+                );
+                ui.selectable_value(
+                    &mut state.cm_state.filter_type,
+                    Some(CredType::Aes256Key),
+                    "AES-256",
                 );
             });
         ui.add_space(6.0);
@@ -436,6 +453,7 @@ pub fn show(ui: &mut Ui, ctx: &egui::Context, state: &mut AppState) {
                 };
                 let secret_color = match (&c.cred_type, c.secret.is_empty()) {
                     (CredType::Hash, _) => theme::WARNING,
+                    (CredType::Aes128Key | CredType::Aes256Key, _) => theme::ACC,
                     (CredType::Password, true) => theme::SUCCESS,
                     (CredType::Password, false) => theme::INFO,
                 };
@@ -453,6 +471,8 @@ pub fn show(ui: &mut Ui, ctx: &egui::Context, state: &mut AppState) {
                     (CredType::Password, true) => ("GUEST", theme::SUCCESS, theme::SUCCESS_BG),
                     (CredType::Password, false) => ("PWD", theme::INFO, theme::INFO_BG),
                     (CredType::Hash, _) => ("HASH", theme::WARNING, theme::WARNING_BG),
+                    (CredType::Aes128Key, _) => ("AES128", theme::ACC, theme::ACC_BG),
+                    (CredType::Aes256Key, _) => ("AES256", theme::ACC, theme::ACC_BG),
                 };
                 let br = Rect::from_min_size(Pos2::new(x + 2.0, y - 9.0), egui::vec2(46.0, 18.0));
                 ui.painter()
@@ -733,23 +753,21 @@ fn show_edit_window(ctx: &egui::Context, state: &mut AppState) {
                         egui::TextEdit::singleline(&mut state.cm_state.form_secret)
                             .desired_width(f32::INFINITY)
                             .password(!state.cm_state.show_secrets)
-                            .hint_text(
-                                if matches!(state.cm_state.form_cred_type, CredType::Password) {
-                                    "empty = guest access"
-                                } else {
-                                    "NT hash (32 hex chars)"
-                                },
-                            )
+                            .hint_text(match state.cm_state.form_cred_type {
+                                CredType::Password => "empty = guest access",
+                                CredType::Hash => "NT hash (32 hex chars)",
+                                CredType::Aes128Key => "AES-128 key (32 hex chars)",
+                                CredType::Aes256Key => "AES-256 key (64 hex chars)",
+                            })
                             .font(egui::TextStyle::Monospace),
                     );
                     ui.label(egui::RichText::new("Type").small().color(theme::MUTED));
                     ui.horizontal(|ui| {
-                        let pwd_selected =
-                            matches!(state.cm_state.form_cred_type, CredType::Password);
+                        let selected = state.cm_state.form_cred_type.clone();
                         if ui
                             .add(
                                 egui::Button::new(egui::RichText::new("Password").small())
-                                    .fill(if pwd_selected {
+                                    .fill(if selected == CredType::Password {
                                         theme::ACC_DIM
                                     } else {
                                         Color32::TRANSPARENT
@@ -763,7 +781,7 @@ fn show_edit_window(ctx: &egui::Context, state: &mut AppState) {
                         if ui
                             .add(
                                 egui::Button::new(egui::RichText::new("Hash").small())
-                                    .fill(if !pwd_selected {
+                                    .fill(if selected == CredType::Hash {
                                         theme::ACC_DIM
                                     } else {
                                         Color32::TRANSPARENT
@@ -773,6 +791,34 @@ fn show_edit_window(ctx: &egui::Context, state: &mut AppState) {
                             .clicked()
                         {
                             state.cm_state.form_cred_type = CredType::Hash;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("AES-128").small())
+                                    .fill(if selected == CredType::Aes128Key {
+                                        theme::ACC_DIM
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    })
+                                    .corner_radius(egui::CornerRadius::same(theme::R_BTN)),
+                            )
+                            .clicked()
+                        {
+                            state.cm_state.form_cred_type = CredType::Aes128Key;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::new(egui::RichText::new("AES-256").small())
+                                    .fill(if selected == CredType::Aes256Key {
+                                        theme::ACC_DIM
+                                    } else {
+                                        Color32::TRANSPARENT
+                                    })
+                                    .corner_radius(egui::CornerRadius::same(theme::R_BTN)),
+                            )
+                            .clicked()
+                        {
+                            state.cm_state.form_cred_type = CredType::Aes256Key;
                         }
                     });
                     ui.label(egui::RichText::new("Tags").small().color(theme::MUTED));
@@ -845,7 +891,10 @@ fn save_form(state: &mut AppState) {
         cm.form_domain.trim().to_string()
     };
     let secret = cm.form_secret.trim().to_string();
-    if username.is_empty() || (secret.is_empty() && cm.form_cred_type == CredType::Hash) {
+    if username.is_empty()
+        || (secret.is_empty() && cm.form_cred_type != CredType::Password)
+        || !credential_secret_shape_is_valid(&cm.form_cred_type, &secret)
+    {
         return;
     }
 
@@ -955,6 +1004,8 @@ fn export_csv(state: &AppState, path: &str) -> Result<(), String> {
             match c.cred_type {
                 CredType::Password => "password".to_string(),
                 CredType::Hash => "hash".to_string(),
+                CredType::Aes128Key => "aes128".to_string(),
+                CredType::Aes256Key => "aes256".to_string(),
             },
             c.protocol.clone(),
             c.valid.map_or(String::new(), |v| v.to_string()),
@@ -991,12 +1042,16 @@ fn import_csv(state: &mut AppState, path: &str) -> Result<(usize, usize, usize),
         let domain = record.get(1).unwrap_or("").trim().to_string();
         let secret = record.get(2).unwrap_or("").trim().to_string();
         let cred_type_str = record.get(3).unwrap_or("password").trim().to_lowercase();
-        let cred_type = if cred_type_str == "hash" {
-            CredType::Hash
-        } else {
-            CredType::Password
+        let cred_type = match cred_type_str.as_str() {
+            "hash" | "nt_hash" => CredType::Hash,
+            "aes128" | "aes-128" => CredType::Aes128Key,
+            "aes256" | "aes-256" => CredType::Aes256Key,
+            _ => CredType::Password,
         };
-        if username.is_empty() || (secret.is_empty() && cred_type == CredType::Hash) {
+        if username.is_empty()
+            || (secret.is_empty() && cred_type != CredType::Password)
+            || !credential_secret_shape_is_valid(&cred_type, &secret)
+        {
             errors += 1;
             continue;
         }
@@ -1052,6 +1107,18 @@ fn import_csv(state: &mut AppState, path: &str) -> Result<(usize, usize, usize),
         imported += 1;
     }
     Ok((imported, skipped, errors))
+}
+
+fn credential_secret_shape_is_valid(cred_type: &CredType, secret: &str) -> bool {
+    match cred_type {
+        CredType::Password => true,
+        CredType::Hash | CredType::Aes128Key => {
+            secret.len() == 32 && secret.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }
+        CredType::Aes256Key => {
+            secret.len() == 64 && secret.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }
+    }
 }
 
 fn native_open_file_dialog() -> Option<String> {

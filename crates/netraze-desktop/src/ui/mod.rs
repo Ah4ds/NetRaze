@@ -3,6 +3,7 @@ pub mod console;
 pub mod credential_manager;
 pub mod credentials_panel;
 mod directory_panel;
+mod kerberos_panel;
 pub mod log_panel;
 pub mod network_view;
 pub mod share_browser;

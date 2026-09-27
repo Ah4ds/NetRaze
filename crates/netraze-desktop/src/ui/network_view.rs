@@ -146,6 +146,8 @@ pub fn show(ui: &mut egui::Ui, state: &mut AppState) {
                                         let type_tag = match cred.cred_type {
                                             crate::state::CredType::Hash => "[H]",
                                             crate::state::CredType::Password => "[P]",
+                                            crate::state::CredType::Aes128Key => "[A128]",
+                                            crate::state::CredType::Aes256Key => "[A256]",
                                         };
                                         let label = format!("{type_tag} {cred_label}");
                                         if ui.button(label).clicked() {
