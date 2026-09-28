@@ -531,7 +531,15 @@ impl KerberosClient {
         let request = build_tgs_req(tgt, service_principal_name, target_realm, nonce, now, rng)?;
         let response = self.transport.exchange(&encode_der(&request)?).await?;
         let reply = decode_tgs_reply(&response)?;
-        finish_tgs_exchange_or_referral(reply, tgt, service_principal_name, target_realm, nonce)
+        finish_tgs_exchange_or_referral(
+            reply,
+            tgt,
+            service_principal_name,
+            target_realm,
+            tgt.client_principal(),
+            tgt.realm(),
+            nonce,
+        )
     }
 
     pub async fn assess_as_rep(
@@ -676,7 +684,7 @@ fn build_tgs_req<R: RngCore + CryptoRng>(
     }))
 }
 
-fn decode_tgs_reply(bytes: &[u8]) -> Result<TgsRep, KerberosError> {
+pub(crate) fn decode_tgs_reply(bytes: &[u8]) -> Result<TgsRep, KerberosError> {
     validate_der_envelope(bytes)?;
     match bytes[0] {
         TGS_REP_TAG => picky_asn1_der::from_bytes(bytes)
@@ -698,11 +706,38 @@ enum TgsExchangeTicket {
     Referral(TicketGrantingTicket),
 }
 
+pub(crate) fn finish_service_tgs_exchange(
+    reply: TgsRep,
+    tgt: &TicketGrantingTicket,
+    requested_spn: &str,
+    requested_realm: &str,
+    expected_client_principal: &str,
+    expected_client_realm: &str,
+    nonce: u32,
+) -> Result<ServiceTicket, KerberosError> {
+    match finish_tgs_exchange_or_referral(
+        reply,
+        tgt,
+        requested_spn,
+        requested_realm,
+        expected_client_principal,
+        expected_client_realm,
+        nonce,
+    )? {
+        TgsExchangeTicket::Service(ticket) => Ok(ticket),
+        TgsExchangeTicket::Referral(_) => Err(KerberosError::InvalidMessage(
+            "S4U exchange unexpectedly returned a referral TGT".to_owned(),
+        )),
+    }
+}
+
 fn finish_tgs_exchange_or_referral(
     reply: TgsRep,
     tgt: &TicketGrantingTicket,
     requested_spn: &str,
     requested_realm: &str,
+    expected_client_principal: &str,
+    expected_client_realm: &str,
     nonce: u32,
 ) -> Result<TgsExchangeTicket, KerberosError> {
     if integer_as_i32(&reply.0.msg_type.0) != Some(13)
@@ -712,11 +747,11 @@ fn finish_tgs_exchange_or_referral(
             .0
             .0
             .to_string()
-            .eq_ignore_ascii_case(tgt.realm())
-        || !principal_name(&reply.0.cname.0).eq_ignore_ascii_case(tgt.client_principal())
+            .eq_ignore_ascii_case(expected_client_realm)
+        || !principal_name(&reply.0.cname.0).eq_ignore_ascii_case(expected_client_principal)
     {
         return Err(KerberosError::InvalidMessage(
-            "TGS-REP client identity does not match the TGT".to_owned(),
+            "TGS-REP client identity does not match the requested client".to_owned(),
         ));
     }
     let reply_encryption_type = encrypted_data_type(&reply.0.enc_part.0)?;
@@ -790,8 +825,8 @@ fn finish_tgs_exchange_or_referral(
         ticket: reply.0.ticket.0,
         session_key,
         session_encryption_type,
-        client_principal: tgt.client_principal.clone(),
-        client_realm: tgt.realm.clone(),
+        client_principal: expected_client_principal.to_owned(),
+        client_realm: expected_client_realm.to_owned(),
         service_principal_name: ticket_spn.clone(),
         realm: ticket_realm.clone(),
         issued_at_unix,
@@ -844,12 +879,15 @@ fn finish_tgs_exchange(
     requested_spn: &str,
     nonce: u32,
 ) -> Result<ServiceTicket, KerberosError> {
-    match finish_tgs_exchange_or_referral(reply, tgt, requested_spn, tgt.kdc_realm(), nonce)? {
-        TgsExchangeTicket::Service(ticket) => Ok(ticket),
-        TgsExchangeTicket::Referral(_) => Err(KerberosError::InvalidMessage(
-            "test exchange unexpectedly returned a referral".to_owned(),
-        )),
-    }
+    finish_service_tgs_exchange(
+        reply,
+        tgt,
+        requested_spn,
+        tgt.kdc_realm(),
+        tgt.client_principal(),
+        tgt.realm(),
+        nonce,
+    )
 }
 
 fn format_as_rep_artifact(
@@ -962,7 +1000,7 @@ fn validate_hash_field(value: &str, label: &str) -> Result<(), KerberosError> {
     Ok(())
 }
 
-fn validate_spn(spn: &str) -> Result<(), KerberosError> {
+pub(crate) fn validate_spn(spn: &str) -> Result<(), KerberosError> {
     validate_hash_field(spn, "SPN")?;
     let components = spn.split('/').collect::<Vec<_>>();
     if components.len() < 2 || components.iter().any(|component| component.is_empty()) {
@@ -1206,6 +1244,21 @@ mod tests {
                 cipher: ExplicitContextTag2::from(OctetStringAsn1::from(encrypted_reply)),
             }),
         });
+        let mut s4u_reply = reply.clone();
+        s4u_reply.0.cname =
+            ExplicitContextTag4::from(principal(NT_PRINCIPAL, &["Administrator"]).unwrap());
+        let s4u_ticket = finish_service_tgs_exchange(
+            s4u_reply,
+            &tgt,
+            "HTTP/web",
+            "EXAMPLE.TEST",
+            "Administrator",
+            "EXAMPLE.TEST",
+            nonce,
+        )
+        .unwrap();
+        assert_eq!(s4u_ticket.client_principal(), "Administrator");
+
         let ticket = finish_tgs_exchange(reply, &tgt, "HTTP/web", nonce).unwrap();
         assert_eq!(ticket.service_principal_name(), "HTTP/web");
         assert_eq!(
@@ -1287,6 +1340,8 @@ mod tests {
             &tgt,
             "ldap/dc01.child.test",
             "CHILD.TEST",
+            tgt.client_principal(),
+            tgt.realm(),
             nonce,
         )
         .unwrap();

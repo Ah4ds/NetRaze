@@ -10,12 +10,14 @@ mod client;
 mod crypto;
 mod error;
 mod gss;
+mod s4u;
 mod ticket;
 mod transport;
 
 pub use crypto::{KerberosEncryptionType, decrypt, derive_password_key, encrypt};
 pub use error::KerberosError;
 pub use gss::{KerberosGssInitiator, KerberosSecurityContext};
+pub use s4u::{S4uDelegationMode, S4uEvidenceTicket};
 pub use ticket::{
     KerberosTicket, KerberosTicketKind, TicketCache, TicketFileFormat, TicketMetadata,
     TicketSelector, export_ticket_file, import_ticket_file,
