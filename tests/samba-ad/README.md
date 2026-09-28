@@ -16,12 +16,12 @@ publishes LDAP, SMB, and Kerberos only on the loopback interface.
 
 | File | Role |
 |---|---|
-| `docker-compose.yml` | Starts the digest-pinned `quay.io/samba.org/samba-ad-server` on loopback ports 1389 (LDAP), 2445 (SMB), and 1088/TCP (Kerberos). A one-shot service installs Kerberos-specific directory fixtures after the DC is healthy. |
+| `docker-compose.yml` | Starts the digest-pinned `quay.io/samba.org/samba-ad-server` on loopback ports 1389 (LDAP), 2445 (SMB), and 1088/TCP+UDP (Kerberos). A one-shot service installs Kerberos-specific directory fixtures after the DC is healthy. |
 | `domain.json` | Password-free template that provisions the fixed test realm, users, groups, service account, and domain controller. |
 | `inject-secrets.py` | Injects required environment-provided passwords into a mode-0600 runtime configuration inside the container, then replaces itself with Samba. |
 | `configure-kerberos-fixtures.sh` | Idempotently adds the HTTP SPN and marks the dedicated AS-REP fixture account as not requiring pre-authentication. |
 | `crates/netraze-protocols/tests/ldap_samba_ad.rs` | Seven ignored, fixed-endpoint integration tests for binds, searches, paging, referrals, inventory, and BloodHound CE export. |
-| `crates/netraze-protocols/tests/kerberos_samba_ad.rs` | Four ignored, fixed-endpoint KDC tests for password TGT acquisition, AS-REP and service-ticket assessment, wrong-password rejection, and the fixture KDC's RC4 policy. |
+| `crates/netraze-protocols/tests/kerberos_samba_ad.rs` | Six ignored, fixed-endpoint tests for UDP/TCP TGT acquisition, AS-REP and service-ticket assessment, wrong-password/RC4 policy, ccache/kirbi round trips, and ticket-backed LDAP/SMB sessions. |
 
 The container runs privileged because Samba AD provisioning needs filesystem
 extended attributes. Do not run it on an untrusted Docker host.
@@ -32,7 +32,7 @@ extended attributes. Do not run it on an untrusted Docker host.
 |---|---|
 | LDAP endpoint | `127.0.0.1:1389` |
 | SMB endpoint | `127.0.0.1:2445` |
-| Kerberos KDC | `127.0.0.1:1088` (TCP) |
+| Kerberos KDC | `127.0.0.1:1088` (TCP and UDP) |
 | Realm | `NETRAZE.TEST` |
 | NetBIOS domain | `NETRAZE` |
 | Administrator password | Runtime-only `NETRAZE_SAMBA_AD_ADMIN_PASSWORD` |
@@ -61,6 +61,11 @@ docker compose -f tests/samba-ad/docker-compose.yml up -d --wait
 provisioning run can take longer than subsequent starts. Run Cargo in the same
 shell so the test client receives the provisioned account password.
 
+Passwords are applied only while a new directory volume is provisioned. If a
+volume from an earlier run was intentionally retained, either reuse that run's
+environment or execute `down -v` before generating new passwords; changing the
+environment alone does not reset existing AD account passwords.
+
 ### Run the LDAP/NTLM and Kerberos integration tests
 
 ```shell
@@ -84,6 +89,8 @@ the shared directory fixture is exercised sequentially during local runs.
 | `wrong_password_and_guest_do_not_authorize_ldap_searches` | Wrong-password and empty-password `Guest` NTLM attempts are rejected and do not authorize a subsequent search. |
 | `protected_search_supports_compound_escaped_filter_and_base_scope` | Signed/sealed compound search with a hex-escaped assertion, base-object lookup, and returned referrals. |
 | `password_preauth_acquires_and_validates_an_aes_tgt` | TCP AS exchange, encrypted timestamp pre-authentication, AES reply decryption, nonce/principal validation, and opaque TGT metadata. |
+| `udp_only_transport_acquires_and_validates_a_tgt` | UDP-only AS exchange against the published KDC port, proving that success is not a silent TCP fallback. |
+| `imported_ccache_and_kirbi_authenticate_ldap_and_smb_sessions` | TGT plus exact `ldap/dc1.netraze.test` and `cifs/dc1.netraze.test` tickets, protected ccache/kirbi export/import, Kerberos LDAP RootDSE, SMB session setup/signing, and SRVSVC server info. |
 | `nt_hash_preauth_reports_the_fixture_kdc_rc4_policy` | Confirms the pinned MIT-backed KDC rejects RC4-only AS requests with `KDC_ERR_ETYPE_NOSUPP`; the successful NT-hash/RC4 exchange is covered by the deterministic loopback test. |
 | `ldap_candidates_produce_as_rep_and_service_ticket_findings` | LDAP discovery of the pre-auth-disabled user and service SPN, AS-REP collection, password TGT acquisition, checksummed TGS request, and service-ticket artifact formatting. |
 | `wrong_password_does_not_produce_a_tgt` | Ensures an invalid password never produces a TGT. |
@@ -118,12 +125,13 @@ you intentionally want to retain its state.
 
 The pinned Samba image uses its MIT-backed KDC policy and does not accept
 RC4-only AS requests, even though NetRaze's NT-hash/RC4 path is exercised by
-an isolated full-exchange test. Not covered here: LDAPS, StartTLS, Kerberos
-ticket import, Kerberos-backed SMB/LDAP sessions, S4U, channel binding,
-cross-domain referral chasing, LDAP writes, or active probes of server signing
-and channel-binding enforcement. The Security tab reports those untested checks
-as `Not tested`; this suite only validates values the directory returns and the
-protection negotiated for its own NTLM session. SMB/SAMR guest and null-session behavior belongs to the separate
+an isolated full-exchange test. Not covered here: LDAPS, StartTLS, live S4U,
+multi-realm referral chasing, live ticket construction, channel binding, LDAP
+writes, or active probes of server signing and channel-binding enforcement.
+Deterministic loopback/unit suites cover S4U, referral policy, and constructed
+ticket integrity. The Security tab reports untested LDAP checks as `Not tested`;
+this suite only validates values the directory returns and the protection
+negotiated for its own sessions. SMB/SAMR guest and null-session behavior belongs to the separate
 [standalone Samba harness](../samba/README.md).
 
 ---
@@ -144,7 +152,7 @@ cargo test -p netraze-protocols --lib
 cargo test -p netraze-protocols --test ldap_samba_ad --test kerberos_samba_ad
 ```
 
-The second command compiles both live suites but leaves their eleven tests ignored.
+The second command compiles both live suites but leaves their thirteen tests ignored.
 
 ---
 
@@ -174,7 +182,8 @@ port bindings:
 docker port netraze-samba-ad
 ```
 
-The expected mappings are `88/tcp -> 127.0.0.1:1088`,
+The expected mappings are `88/tcp -> 127.0.0.1:1088` and
+`88/udp -> 127.0.0.1:1088`,
 `389/tcp -> 127.0.0.1:1389`, and `445/tcp -> 127.0.0.1:2445`. A stale volume after fixture changes or a
 port collision are the first things to check; do not redirect the tests to
 an unrelated directory server.

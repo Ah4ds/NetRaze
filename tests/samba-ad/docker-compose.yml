@@ -15,6 +15,7 @@ services:
       - "127.0.0.1:1389:389"
       - "127.0.0.1:2445:445"
       - "127.0.0.1:1088:88/tcp"
+      - "127.0.0.1:1088:88/udp"
     environment:
       SAMBACC_CONFIG_TEMPLATE: /config/domain.json
       SAMBA_CONTAINER_ID: netraze-ad

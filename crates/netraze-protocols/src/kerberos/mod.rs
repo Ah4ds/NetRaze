@@ -1,8 +1,9 @@
 //! Pure-Rust Kerberos v5 client foundations.
 //!
-//! KDC requests use the TCP record marking defined by RFC 4120 section 7.2.2:
-//! a four-byte network-order length followed by one DER-encoded Kerberos
-//! message. Higher-level AS and TGS exchanges live above this bounded transport
+//! KDC requests use bounded RFC 4120 UDP datagrams with policy-controlled TCP
+//! fallback. TCP exchanges use the section 7.2.2 record marking: a four-byte
+//! network-order length followed by one DER-encoded Kerberos message.
+//! Higher-level AS, TGS, referral, and S4U exchanges live above this transport
 //! and never expose `picky-krb` representations to callers.
 
 mod assessment;

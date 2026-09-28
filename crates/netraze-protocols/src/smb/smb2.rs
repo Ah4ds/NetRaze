@@ -1290,7 +1290,12 @@ impl Smb2Session {
                 "Kerberos authentication was downgraded to a guest or anonymous SMB session".into(),
             );
         }
-        self.signing_key = Some(context.session_key().to_vec());
+        // MS-SMB2 3.2.5.3 stores Session.SessionKey as the first 16 bytes
+        // of the key exported by GSS (or right-pads a shorter key). Kerberos
+        // AES-256 contexts can export 32 bytes; feeding all 32 into the SMB
+        // 2.0.2/2.1 HMAC makes the first signed TREE_CONNECT fail with
+        // STATUS_ACCESS_DENIED even though SESSION_SETUP succeeded.
+        self.signing_key = Some(smb2_session_key(context.session_key()).to_vec());
         Ok(())
     }
 
@@ -1494,6 +1499,15 @@ fn sign_smb2_message(message: &mut [u8], session_key: &[u8]) -> Result<(), Strin
     let mac = super::crypto::hmac_sha256(session_key, message)?;
     message[48..SMB2_HEADER_SIZE].copy_from_slice(&mac[..16]);
     Ok(())
+}
+
+/// Normalize the authentication mechanism's exported context key into the
+/// 128-bit SMB2 Session.SessionKey defined by MS-SMB2 section 3.2.1.3.
+fn smb2_session_key(context_key: &[u8]) -> [u8; 16] {
+    let mut session_key = [0_u8; 16];
+    let copied = context_key.len().min(session_key.len());
+    session_key[..copied].copy_from_slice(&context_key[..copied]);
+    session_key
 }
 
 /// Return the bounded security buffer from an SMB2 SESSION_SETUP response.
@@ -2310,6 +2324,17 @@ mod signing_tests {
 
         response[SMB2_HEADER_SIZE + 6..SMB2_HEADER_SIZE + 8].copy_from_slice(&4_u16.to_le_bytes());
         assert!(session_setup_security_buffer(&response).is_err());
+    }
+
+    #[test]
+    fn gss_context_keys_are_normalized_to_the_smb2_session_key() {
+        let aes256 = (0_u8..32).collect::<Vec<_>>();
+        assert_eq!(smb2_session_key(&aes256), core::array::from_fn(|i| i as u8));
+
+        let short = [0xa5_u8; 8];
+        let mut padded = [0_u8; 16];
+        padded[..short.len()].copy_from_slice(&short);
+        assert_eq!(smb2_session_key(&short), padded);
     }
 
     /// Known-answer test for the SMB 2.0.2/2.1 signing MAC, cross-checked

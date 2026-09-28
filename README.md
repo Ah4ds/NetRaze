@@ -84,6 +84,7 @@ and works from any attacker OS.
 | Anonymous (null session) access | `connect_anonymous` — empty AUTHENTICATE, IS_NULL accepted |
 | Guest access (username, no secret) | `connect_guest` — rides the server's map-to-guest policy |
 | Pass-the-hash authentication | NTLMv2 with a supplied NT hash |
+| Kerberos pass-the-ticket authentication | Exact `cifs/host` service ticket imported from ccache v4 or kirbi; AP-REP validation and SMB signing |
 | SMB signing (HMAC-SHA256, dialects 2.0.2/2.1) | applied in `smb2::send_packet` when the server demands it |
 | Host fingerprinting | `fingerprint` |
 | Share enumeration (SRVSVC `NetrShareEnum`) | `shares_rpc` |
@@ -108,7 +109,7 @@ enumeration work in both modes.
 | Protocol | State |
 |---|---|
 | LDAP | Port 389; NTLMv2 SASL/SPNEGO sign-and-seal (password or NT hash), anonymous bind, RootDSE, paged read-only AD inventory (users, groups, computers, OUs, topology, privileged principals, SPNs, and reported security policy), plus BloodHound Community Edition schema-v6 JSON/ZIP export. |
-| Kerberos | TCP KDC transport; password, NT-hash, AES-128, and AES-256 TGT acquisition; LDAP-assisted or explicit AS-REP/service-SPN assessment; RC4/AES ticket processing; explicit Hashcat-compatible artifact export. |
+| Kerberos | Bounded UDP/TCP KDC transport; password, NT-hash, AES-128, and AES-256 TGT acquisition; ccache v4/kirbi import and protected export; LDAP/SMB pass-the-ticket; allowlisted realm referrals; S4U2Self/S4U2Proxy; Golden, Silver, Diamond, and Sapphire ticket construction; LDAP-assisted or explicit AS-REP/service-SPN assessment. |
 | WinRM, MSSQL, SSH, RDP, FTP, NFS, VNC, WMI | Scaffold only — factory registered, no wire code yet |
 
 ### DCE/RPC stack (`netraze-dcerpc`)
@@ -122,8 +123,9 @@ enumeration work in both modes.
 
 ### What's next
 
-- Kerberos-backed SMB/LDAP session authentication, ticket import, and S4U
-  delegation flows. The AS/TGS assessment foundation is implemented.
+- Kerberos follow-ups: live multi-realm referral fixtures, broader delegated
+  service coverage, and SMB 3.x dialect/key derivation. UDP/TCP AS/TGS,
+  ticket-backed SMB/LDAP, S4U, and explicit ticket construction are implemented.
 - SMB3 encryption (AES-CCM/GCM) — most targets still accept unencrypted
   SMB2.
 - LDAP follow-ups — ACL/security-descriptor collection and active checks for
@@ -233,14 +235,25 @@ For pass-the-hash authentication, put the 32-character NT hash in an
 environment variable and replace `--password-env` with `--nt-hash-env`.
 The exporter writes loose BloodHound CE schema-v6 JSON files and a ZIP archive.
 
-Kerberos secrets also stay out of the command line. TGT validation does not
-save a ticket, and roast material is written only when `--output` is supplied:
+Kerberos secrets also stay out of the command line. TGTs remain in memory
+unless an explicit output is selected, and roast material is written only when
+`--output` is supplied:
 
 ```shell
 export NETRAZE_KRB_PASSWORD='replace-with-an-authorized-test-password'
 cargo run -p netraze-cli -- kerberos tgt \
   --kdc dc.example.test:88 --realm EXAMPLE.TEST --username alice \
-  --password-env NETRAZE_KRB_PASSWORD
+  --password-env NETRAZE_KRB_PASSWORD \
+  --output ./alice.ccache
+
+# Add an exact service ticket to a new cache, then use it without a password.
+cargo run -p netraze-cli -- kerberos service-ticket \
+  --kdc dc.example.test:88 --realm EXAMPLE.TEST \
+  --ticket ./alice.ccache --service-principal ldap/dc.example.test \
+  --output ./alice-ldap.ccache
+cargo run -p netraze-cli -- kerberos ldap-session \
+  --endpoint dc.example.test:389 --service-host dc.example.test \
+  --ticket ./alice-ldap.ccache
 
 cargo run -p netraze-cli -- kerberos kerberoast \
   --kdc dc.example.test:88 --realm EXAMPLE.TEST --username alice \
@@ -254,6 +267,14 @@ unset NETRAZE_KRB_PASSWORD
 `--users-file`, or LDAP discovery. Use `--nt-hash-env`, `--aes128-key-env`, or
 `--aes256-key-env` in place of `--password-env` for the corresponding TGT
 credential.
+
+`kerberos ticket-info` shows non-secret cache metadata. `service-ticket` can
+request `ldap/host`, `cifs/host`, or another exact SPN from an imported TGT;
+`ldap-session` and `smb-session` then perform pass-the-ticket authentication.
+`kerberos s4u` exercises an already configured constrained or resource-based
+delegation path. The `kerberos forge` subcommands require complete identity,
+lifetime, KVNO, SID, and environment-key inputs and never infer domain secrets.
+Use `cargo run -p netraze-cli -- kerberos --help` for the full argument set.
 
 ## Desktop GUI
 
@@ -276,8 +297,9 @@ Credential Manager's CSV import.
 For SMB or LDAP scans, enter a target and select the protocol in
 Configuration. The Username, Password, and NTLM Hash fields apply to both;
 `DOMAIN\username` selects a domain, and an NT hash takes priority over a
-password. A nonempty Kerberos Ticket field is rejected because ticket
-authentication is not implemented. If the credential fields are blank,
+password. Alternatively, select a ccache/kirbi file and enter the exact DNS
+service host; the cache must contain a current `cifs/host` or `ldap/host`
+ticket for the selected protocol. If the credential fields are blank,
 each target reuses its current **Login As** account or scans anonymously
 when it has none. Entered credentials override that choice and are added
 to Credential Manager when the scan starts. A missing saved secret is an
@@ -290,9 +312,11 @@ For Kerberos scans, select **Kerberos** in Configuration, supply the realm and
 optionally a separate KDC endpoint, then choose AS-REP and/or service-SPN
 assessment. Targets can be entered explicitly or discovered from the current
 LDAP inventory. Password, NT hash, AES-128, and AES-256 credentials are
-supported; imported tickets are not. Result nodes persist only safe finding
-metadata. The sensitive artifact material remains in memory for the current
-session and is written only through **Export Hashcat material…**.
+supported. An imported cache can supply the TGT and, when LDAP discovery is
+needed, an exact `ldap/host` service ticket. Result nodes persist only safe
+finding metadata. Sensitive roast artifacts and acquired/imported TGTs remain
+in memory for the current session and are written only through **Export
+Hashcat material…** or **Export TGT…**.
 
 LDAP discovery creates an **AD Directory** workflow node with Overview,
 Users, Groups, Computers, OUs, Topology, Privileged, Services, and Security
@@ -312,9 +336,11 @@ sessions, local groups, SYSVOL data, or Kerberos-only relationships; LDAPS and
 referral chasing also remain out of scope. LDAP referrals are returned to the
 caller and never followed with credentials.
 
-**Workspace files contain Credential Manager secrets** (passwords and NT
-hashes) in their saved JSON. Treat them as sensitive files and do not
-commit or share them. Session-only credential copies are not serialized.
+**Workspace files contain Credential Manager secrets** (passwords, NT hashes,
+and AES keys) in their saved JSON. Treat them as sensitive files and do not
+commit or share them. Ticket bytes/session keys and session-only credentials
+are not serialized; only the operator-selected ticket path and service host are
+restored.
 
 Backend is `wgpu` by default, which works natively on Linux (Vulkan),
 Windows (DX12), macOS (Metal), and in WSL (via Lavapipe software
@@ -405,10 +431,12 @@ implemented SMB/DCE-RPC, LDAP/NTLM, and Kerberos paths:
    read-only inventory. It also checks anonymous RootDSE access, rejection
    of wrong-password and Guest NTLM binds, protected searches with escaped
    filters and returned referrals, and a complete BloodHound CE schema-v6
-   JSON/ZIP export. Kerberos coverage includes password/AES TGT acquisition,
-   wrong-password rejection, LDAP-discovered AS-REP and SPN candidates, and
-   end-to-end AS/TGS artifact collection. Deterministic unit and loopback tests
-   cover NT-hash/RC4 exchanges because the pinned KDC rejects RC4 by policy.
+   JSON/ZIP export. Kerberos coverage includes UDP-only and fallback-capable
+   KDC transport, password/AES TGT acquisition, wrong-password rejection,
+   LDAP-discovered AS-REP and SPN candidates, end-to-end AS/TGS artifacts, and
+   ccache/kirbi-backed LDAP/SMB sessions. Deterministic unit and loopback tests
+   cover NT-hash/RC4, referral, S4U, and ticket-construction exchanges that the
+   single-realm fixture cannot exercise directly.
 
 See the [SMB harness guide](tests/samba/README.md) and
 [LDAP harness guide](tests/samba-ad/README.md) for local commands.
@@ -421,7 +449,7 @@ See the [SMB harness guide](tests/samba/README.md) and
 | Phase 1 | DCE/RPC primitives, NTLMSSP, SMB2 auth, SRVSVC, Samba harness | Done |
 | Phase 2 | SMB2 IOCTL / FSCTL_PIPE_TRANSCEIVE, SMB signing, SAM RemoteOperations, SQLite workspace, CLI execution path | Mostly done — pipe transport, signing and SAM remote ops landed; SQLite workspace and the CLI execution path remain |
 | Phase 3 | Deep per-protocol modules inside `netraze-protocols`, stable plugin API, JSON/CSV export, priority module parity with NetExec | Planned |
-| Phase 4 | Integration test corpus, network fixtures, TUI or machine-friendly API, Kerberos | In progress — Kerberos AS/TGS assessment and its Samba AD fixture are delivered |
+| Phase 4 | Integration test corpus, network fixtures, TUI or machine-friendly API, Kerberos | In progress — Kerberos ticket lifecycle, sessions, delegation/construction APIs, CLI/desktop workflows, and Samba AD fixture are delivered; a TUI remains |
 
 Full write-up in [`docs/migration-roadmap.md`](docs/migration-roadmap.md).
 
@@ -432,9 +460,10 @@ This is an early-stage port. The highest-leverage contributions right now:
 - **LDAP follow-ups** (`netraze-protocols::ldap`) — security-descriptor
   collection and explicitly tested policy probes; the read-only inventory
   already covers users, groups, computers, SPNs, and directory structure.
-- **Kerberos follow-ups** (`netraze-protocols::kerberos`) — ticket-backed
-  SMB/LDAP authentication, ccache/kirbi import, and delegation flows; bounded
-  AS/TGS exchange and RC4/AES assessment are already delivered.
+- **Kerberos follow-ups** (`netraze-protocols::kerberos`) — add multi-realm and
+  delegated-service live fixtures, then extend SMB support beyond dialect 2.1;
+  ccache/kirbi, pass-the-ticket, S4U, referrals, UDP/TCP, and explicit ticket
+  construction are already delivered.
 - **Deep per-protocol modules** inside `netraze-protocols` as coverage grows.
 - **Impacket-pinned fixtures** for each new DCE/RPC interface added
   (see `crates/netraze-dcerpc/tests/gen_*.py` for the pattern).

@@ -138,6 +138,21 @@ enum KerberosCommand {
         #[arg(long)]
         ticket: PathBuf,
     },
+    /// Request one service ticket from an imported TGT and save both in a cache.
+    ServiceTicket {
+        #[command(flatten)]
+        target: KerberosTargetArgs,
+        #[arg(long)]
+        ticket: PathBuf,
+        #[arg(long)]
+        service_principal: String,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, value_enum, default_value_t = TicketFormatArg::Ccache)]
+        format: TicketFormatArg,
+        #[arg(long)]
+        overwrite: bool,
+    },
     /// Authenticate an LDAP inventory session with an imported service ticket.
     LdapSession {
         #[arg(long)]
@@ -630,6 +645,35 @@ async fn run_kerberos(command: KerberosCommand) -> Result<()> {
                     metadata.valid_until_unix
                 );
             }
+        }
+        KerberosCommand::ServiceTicket {
+            target,
+            ticket,
+            service_principal,
+            output,
+            format,
+            overwrite,
+        } => {
+            let cache = import_ticket_file(&ticket)?;
+            let tgt = cache
+                .select(&TicketSelector {
+                    realm: Some(target.realm.clone()),
+                    ..TicketSelector::default()
+                })?
+                .to_tgt()?;
+            let client = kerberos_client(target)?;
+            let service = client
+                .request_service_ticket(&tgt, &service_principal)
+                .await?;
+            let mut output_cache = TicketCache::from_tgt(&tgt);
+            output_cache.push(KerberosTicket::from_service(&service))?;
+            export_ticket_file(&output, &output_cache, format.into(), overwrite)?;
+            println!(
+                "[+] {} ticket for {} exported with its TGT to {}",
+                service.service_principal_name(),
+                service.client_principal(),
+                output.display()
+            );
         }
         KerberosCommand::LdapSession {
             endpoint,
@@ -1283,6 +1327,24 @@ mod tests {
                 "EXAMPLE.TEST",
                 "--user",
                 "asrep-user",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "netraze",
+                "kerberos",
+                "service-ticket",
+                "--kdc",
+                "dc.example.test",
+                "--realm",
+                "EXAMPLE.TEST",
+                "--ticket",
+                "alice.ccache",
+                "--service-principal",
+                "ldap/dc.example.test",
+                "--output",
+                "ldap.ccache",
             ])
             .is_ok()
         );

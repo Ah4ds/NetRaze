@@ -171,7 +171,7 @@ impl CredentialConfig {
         }
         if !self.kerberos_ticket.trim().is_empty() {
             return Err(
-                "Kerberos ticket authentication is not available for these scans".to_owned(),
+                "Imported Kerberos tickets must use the ticket-backed scan path".to_owned(),
             );
         }
         let entered = self.username.trim();
@@ -208,7 +208,9 @@ impl CredentialConfig {
     /// desktop's normal per-host `Login As` behavior.
     pub fn as_kerberos_record(&self) -> Result<Option<CredentialRecord>, String> {
         if !self.kerberos_ticket.trim().is_empty() {
-            return Err("Kerberos ticket import is not supported yet".to_owned());
+            return Err(
+                "Imported Kerberos tickets must use the ticket-backed scan path".to_owned(),
+            );
         }
         let secret_count = usize::from(!self.password.is_empty())
             + usize::from(!self.ntlm_hash.trim().is_empty())

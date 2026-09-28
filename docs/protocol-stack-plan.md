@@ -48,7 +48,7 @@ porte **à la demande**, par module Rust ciblé, avec Impacket comme
 | ASN.1 / DER / BER | `rasn-ldap` pour LDAP ; `picky-asn1`/`picky-krb` pour Kerberos | ✅ | Façades internes étroites, enveloppes et allocations bornées |
 | NTLMSSP (NEGOTIATE/CHALLENGE/AUTHENTICATE + seal/sign) | `netraze-protocols::ntlm` | ✅ | Implémentation LDAP SASL partagée dans le crate protocoles; SMB et DCE/RPC restent inchangés jusqu'à migration validée |
 | SPNEGO wrapping | `netraze-protocols::ntlm::spnego` | ✅ | Parsing borné et `mechListMIC` validés pour LDAP SASL/GSS-SPNEGO |
-| Kerberos AS-REQ/REP, TGS-REQ/REP | `netraze-protocols::kerberos` | ✅ | TGT mot de passe/hash NT/clés AES, AS-REP et tickets de service ; S4U reste hors scope |
+| Kerberos AS-REQ/REP, TGS-REQ/REP | `netraze-protocols::kerberos` | ✅ | UDP/TCP borné, TGT mot de passe/hash NT/clés AES, tickets de service et referrals explicitement autorisés |
 
 ---
 
@@ -73,7 +73,7 @@ porte **à la demande**, par module Rust ciblé, avec Impacket comme
 | Create Directory (FILE_DIRECTORY_FILE) | ✅ | Phase D — live Samba (browser) |
 | **SMB signing (HMAC-SHA256)** | ✅ | Dialectes 2.0.2/2.1 — HMAC-SHA256(ExportedSessionKey) sur le message entier ; appliqué dans `send_packet` quand le Negotiate serveur exige la signature (DC). Vérifié live contre un DC |
 | SMB3 encryption (AES-CCM/GCM) | ⚪ | Out v1 — la plupart des cibles acceptent SMB2 unencrypted |
-| Kerberos session setup (AP-REQ in SPNEGO) | 🔜 | Couplé avec `netraze-protocols::kerberos` |
+| Kerberos session setup (AP-REQ in SPNEGO) | ✅ | Ticket `cifs/host` exact, AP-REP mutuel, clé GSS tronquée à 128 bits selon MS-SMB2 et signature HMAC-SHA256 ; ccache/kirbi validés live contre Samba AD |
 
 ### `netraze-dcerpc` (DCE/RPC v5 + NDR + auth + interfaces)
 
@@ -118,6 +118,7 @@ est limité à la lecture de RootDSE, sans assertion d'énumération du domaine.
 | Bind simple avec mot de passe en clair | ❌ | Non exposé ; seul le bind anonyme (nom et mot de passe vides) utilise cette forme sur le port 389 |
 | Bind anonyme | ✅ | BER non protégé après bind ; RootDSE validé en test unitaire et contre le Samba AD local, sans assertion d'énumération du domaine |
 | `bind::sasl_gss_spnego` (NTLMSSP wrapped) | ✅ | NTLMv2 mot de passe/hash, MIC, sign-and-seal |
+| Bind Kerberos GSS-SPNEGO | ✅ | Ticket `ldap/host` exact, AP-REP mutuel et protection RFC 4121 ; ccache importé validé live contre Samba AD |
 | `search::request` + `search::result_entry` | ✅ | RFC 4511 §4.5, framing borné |
 | `controls::paged_results` (1.2.840.113556.1.4.319) | ✅ | Cookies itérés avec détection des répétitions |
 | `controls::sd_flags` (security descriptor) | ✅ | Contrôle AD SD Flags utilisé par l'export BloodHound CE, avec Show Deleted et pagination |
@@ -164,15 +165,17 @@ enum_users(target, cred):
 
 | Op | Statut | Use case |
 |---|---|---|
-| ASN.1 Kerberos types (PA-DATA, principal, tickets, erreurs) | ✅ | `picky-krb`, DER strict et transport TCP borné |
+| ASN.1 Kerberos types (PA-DATA, principal, tickets, erreurs) | ✅ | `picky-krb`, DER strict et transports UDP/TCP bornés avec fallback sur réponse trop grande/timeout |
 | AS-REQ / AS-REP | ✅ | TGT en mémoire avec mot de passe, hash NT, clé AES-128 ou AES-256 ; nonce, principal, realm et durée validés |
 | TGS-REQ / TGS-REP | ✅ | AP-REQ checksummé, authenticator chiffré, ticket de service validé contre le KDC Samba AD local |
+| Referrals inter-realm | 🟡 | Suivi borné, détection boucle/hops et mapping realm→KDC explicitement autorisé ; tests loopback, fixture multi-realm live à ajouter |
 | Détection sans pré-auth | ✅ | Cibles explicites ou inventaire LDAP ; AS-REP validé live sur le fixture `asrep` |
 | Encrypt/decrypt RC4-HMAC, AES128/256-CTS-HMAC-SHA1-96 | ✅ | Vecteurs RFC/Impacket, échanges loopback et AES validé live ; le KDC MIT du fixture refuse les AS-REQ RC4-only par politique |
 | Format Krb5 ASCII (modes Hashcat 18200/19800/19900, 13100/19600/19700) | ✅ | Métadonnées sûres persistées ; matière sensible exportée seulement sur action explicite en fichier 0600 sous Unix |
-| Pass-the-ticket (kirbi/ccache) | ⚪ | Out v1 |
-| S4U2Self / S4U2Proxy | ⚪ | Constrained delegation abuse — phase 2 |
-| Diamond/Sapphire ticket | ⚪ | Phase 3 |
+| Import/export ccache v4 et KRB-CRED `.kirbi` | ✅ | Parsing borné, validation métadonnées/ticket, sélection exacte et export atomique mode 0600 ; round-trip live |
+| Pass-the-ticket LDAP/SMB | ✅ | `ldap/host` et `cifs/host` sans fallback NTLM ; API, CLI et desktop, validés live Samba AD |
+| S4U2Self / S4U2Proxy | 🟡 | Délégation constrained et RBCD, validation transited-policy/forwardable et preuves U2U Sapphire ; loopback déterministe, fixture live à ajouter |
+| Golden / Silver / Diamond / Sapphire | 🟡 | PAC borné et resigné via clés explicites, identité/SID/KVNO/durées obligatoires, export CLI ; tests connus/unitaires, pas de construction live dans le fixture |
 
 ---
 
@@ -251,8 +254,11 @@ Statut **module-level** — peut composer plusieurs interfaces RPC.
 
 L'ordre **chronologique** dans lequel je recommande d'avancer.
 Les chantiers 1–5 et 8 (SMB2 file ops, `exec_rpc`, `browser_rpc`, LDAP,
-Kerberos, SMB signing) sont **faits** ; LDAP, l'export BloodHound CE et les
-échanges Kerberos AS/TGS sont validés contre le harness Samba AD local. Reste, chaque ligne débloquant
+Kerberos, SMB signing) sont **faits** ; LDAP, l'export BloodHound CE, les
+échanges Kerberos AS/TGS, UDP et les sessions LDAP/SMB par ticket sont validés
+contre le harness Samba AD local. Les referrals inter-realm, S4U et la
+construction de tickets ont des tests déterministes mais attendent encore des
+fixtures live dédiés. Reste, chaque ligne débloquant
 les suivantes :
 
 | # | Chantier | Coût | Débloque |
@@ -261,7 +267,7 @@ les suivantes :
 | ~~2~~ | ~~**Phase D.3** — `exec_rpc` via SCMR~~ | ✅ fait | smbexec complet (create/start/stop/delete) — wire-smoke Samba OK |
 | ~~3~~ | ~~**Phase D.4** — `browser_rpc`~~ | ✅ fait | browser cross-platform + suites browser_ops |
 | ~~4~~ | ~~**Module `netraze-protocols::ldap`** — BER, bind SASL/NTLMSSP, recherche paginée, inventaire AD et export BloodHound CE~~ | ✅ fait | Utilisateurs, groupes, ordinateurs, OU, topologie, privilèges, SPN, politiques rapportées et JSON/ZIP CE schéma v6 |
-| ~~5~~ | ~~**Module `netraze-protocols::kerberos`** — ASN.1 Kerberos + AS-REQ/REP + TGS-REQ/REP + RC4/AES decrypt~~ | ✅ fait | TGT, AS-REProast et Kerberoast en CLI/desktop ; pass-the-ticket et S4U restent séparés |
+| ~~5~~ | ~~**Module `netraze-protocols::kerberos`** — ASN.1 Kerberos + AS-REQ/REP + TGS-REQ/REP + RC4/AES decrypt~~ | ✅ fait | TGT, AS-REProast/Kerberoast, ccache/kirbi, pass-the-ticket LDAP/SMB, S4U, referrals et construction explicite ; validation live complémentaire encore utile pour les trois derniers |
 | 6 | `dcerpc.lsarpc` — OpenPolicy2 + LookupSids/Names | 3j | Account naming dans LSA dump |
 | 7 | `dcerpc.drsuapi` — DRSBind + DRSGetNCChanges | 10j | **DCSync** = NTDS.dit complet sans toucher disque |
 | ~~8~~ | ~~SMB signing HMAC-SHA256~~ | ✅ fait | dialectes 2.0.2/2.1 — vérifié live contre un DC "require signing" |
