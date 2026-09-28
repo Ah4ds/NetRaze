@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex};
 
 use netraze_dcerpc::interfaces::srvsvc;
 
+use crate::kerberos::ServiceTicket;
+
 use super::connection::SmbCredential;
 use super::rpc::{bind_srvsvc_over_smb, connect_session, host_only};
 use super::smb2::Smb2Session;
@@ -75,13 +77,42 @@ pub async fn get_server_info(target: &str, cred: &SmbCredential) -> Result<Serve
         .await
         .map_err(|e| format!("spawn_blocking(connect+tree): {e}"))??;
 
+    get_server_info_on_session(session, ipc_tid, cred).await
+}
+
+/// Query SRVSVC over an exact Kerberos-authenticated SMB session.
+pub async fn get_server_info_kerberos(
+    target: &str,
+    service_host: &str,
+    ticket: &ServiceTicket,
+) -> Result<ServerInfo, String> {
+    let target_owned = target.to_owned();
+    let service_host = service_host.to_owned();
+    let ticket = ticket.clone();
+    let (session, ipc_tid) =
+        tokio::task::spawn_blocking(move || -> Result<(Smb2Session, u32), String> {
+            let mut session =
+                Smb2Session::connect_with_kerberos(&target_owned, &service_host, &ticket)?;
+            let ipc_tid = session.tree_connect(&host_only(&target_owned), "IPC$")?;
+            Ok((session, ipc_tid))
+        })
+        .await
+        .map_err(|error| format!("spawn_blocking(connect+tree): {error}"))??;
+    get_server_info_on_session(session, ipc_tid, &SmbCredential::new("", "", "")).await
+}
+
+async fn get_server_info_on_session(
+    session: Smb2Session,
+    ipc_tid: u32,
+    dce_credential: &SmbCredential,
+) -> Result<ServerInfo, String> {
     let session = Arc::new(Mutex::new(session));
 
     // ── Stage 3-4: open \PIPE\srvsvc + bind. Authenticated PKT_PRIVACY
     // bind first; DCs that BindNak the NTLMSSP bind fall back to an
     // anonymous bind riding the (authenticated) SMB session — see
     // `bind_srvsvc_over_smb`.
-    let mut channel = bind_srvsvc_over_smb(Arc::clone(&session), ipc_tid, cred).await?;
+    let mut channel = bind_srvsvc_over_smb(Arc::clone(&session), ipc_tid, dce_credential).await?;
 
     // ── Stage 5: opnum 21 round-trip.
     let stub = srvsvc::encode_netr_server_get_info_request("", 101);

@@ -2,6 +2,7 @@
 
 use netraze_core::{DirectoryInventory, DirectoryServerInfo};
 
+use crate::kerberos::ServiceTicket;
 use crate::ntlm::NtlmCredential;
 
 use super::{LdapClient, LdapClientConfig, LdapEntry, LdapError};
@@ -14,6 +15,10 @@ pub enum LdapAuthentication {
         username: String,
         domain: String,
         credential: NtlmCredential,
+    },
+    Kerberos {
+        service_host: String,
+        ticket: Box<ServiceTicket>,
     },
 }
 
@@ -56,6 +61,10 @@ pub async fn inventory_with_authentication(
             domain,
             credential,
         } => client.bind_ntlm(&username, &domain, credential).await,
+        LdapAuthentication::Kerberos {
+            service_host,
+            ticket,
+        } => client.bind_kerberos(&service_host, &ticket).await,
     };
     if let Err(error) = bind_result {
         let _ = client.unbind().await;

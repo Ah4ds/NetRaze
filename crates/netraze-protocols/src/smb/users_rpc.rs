@@ -22,8 +22,11 @@ pub use netraze_core::UserInfo;
 use netraze_dcerpc::channel::RpcChannel;
 use netraze_dcerpc::interfaces::samr;
 
+use crate::kerberos::ServiceTicket;
+
 use super::connection::SmbCredential;
-use super::rpc::{bind_samr_over_smb, connect_session};
+use super::rpc::{bind_samr_over_smb, connect_session, host_only};
+use super::smb2::Smb2Session;
 
 /// NTSTATUS `STATUS_MORE_ENTRIES` — resume handle is valid, call again.
 const STATUS_MORE_ENTRIES: u32 = 0x0000_0105;
@@ -67,6 +70,35 @@ pub async fn enum_users(target: &str, cred: &SmbCredential) -> Result<Vec<UserIn
         .await
         .map_err(|e| format!("SAMR bind: {e}"))?;
 
+    enumerate_users_on_channel(&mut ch).await
+}
+
+/// Enumerate SAMR users over an exact Kerberos-authenticated SMB session.
+pub async fn enum_users_kerberos(
+    target: &str,
+    service_host: &str,
+    ticket: &ServiceTicket,
+) -> Result<Vec<UserInfo>, String> {
+    let target_owned = target.to_owned();
+    let service_host = service_host.to_owned();
+    let ticket = ticket.clone();
+    let (session, ipc) =
+        tokio::task::spawn_blocking(move || -> Result<(Smb2Session, u32), String> {
+            let mut session =
+                Smb2Session::connect_with_kerberos(&target_owned, &service_host, &ticket)?;
+            let ipc = session.tree_connect(&host_only(&target_owned), "IPC$")?;
+            Ok((session, ipc))
+        })
+        .await
+        .map_err(|error| format!("spawn_blocking(connect+tree): {error}"))??;
+    let session = Arc::new(Mutex::new(session));
+    let mut channel = bind_samr_over_smb(session, ipc, &SmbCredential::new("", "", ""))
+        .await
+        .map_err(|error| format!("SAMR bind: {error}"))?;
+    enumerate_users_on_channel(&mut channel).await
+}
+
+async fn enumerate_users_on_channel(ch: &mut RpcChannel) -> Result<Vec<UserInfo>, String> {
     // 2. SamrConnect2
     // Windows SAMR expects a NULL server name; passing an IP or hostname
     // yields RPC_X_BAD_STUB_DATA on most targets.
@@ -126,7 +158,7 @@ pub async fn enum_users(target: &str, cred: &SmbCredential) -> Result<Vec<UserIn
 
     if domain_name.is_empty() {
         // Nothing useful found — close server handle and bail.
-        let _ = close_handle(&mut ch, &server_handle).await;
+        let _ = close_handle(ch, &server_handle).await;
         return Ok(Vec::new());
     }
 
@@ -139,7 +171,7 @@ pub async fn enum_users(target: &str, cred: &SmbCredential) -> Result<Vec<UserIn
     let (domain_sid, status) =
         samr::decode_samr_lookup_domain_response(&resp_lookup).map_err(|e| e.to_string())?;
     if status != 0 {
-        let _ = close_handle(&mut ch, &server_handle).await;
+        let _ = close_handle(ch, &server_handle).await;
         return Err(format!(
             "SamrLookupDomain failed with status 0x{status:08x}"
         ));
@@ -155,7 +187,7 @@ pub async fn enum_users(target: &str, cred: &SmbCredential) -> Result<Vec<UserIn
     let (domain_handle, status) =
         samr::decode_samr_open_domain_response(&resp_open).map_err(|e| e.to_string())?;
     if status != 0 {
-        let _ = close_handle(&mut ch, &server_handle).await;
+        let _ = close_handle(ch, &server_handle).await;
         return Err(format!("SamrOpenDomain failed with status 0x{status:08x}"));
     }
 
@@ -220,7 +252,7 @@ pub async fn enum_users(target: &str, cred: &SmbCredential) -> Result<Vec<UserIn
                                 }
                             }
                         }
-                        let _ = close_handle(&mut ch, &user_handle).await;
+                        let _ = close_handle(ch, &user_handle).await;
                     }
                 }
             }
@@ -236,8 +268,8 @@ pub async fn enum_users(target: &str, cred: &SmbCredential) -> Result<Vec<UserIn
     }
 
     // 7. Cleanup
-    let _ = close_handle(&mut ch, &domain_handle).await;
-    let _ = close_handle(&mut ch, &server_handle).await;
+    let _ = close_handle(ch, &domain_handle).await;
+    let _ = close_handle(ch, &server_handle).await;
 
     Ok(users)
 }

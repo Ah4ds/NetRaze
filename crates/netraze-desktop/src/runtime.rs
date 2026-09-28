@@ -89,6 +89,7 @@ pub enum RuntimeEvent {
         realm: String,
         cred_label: Option<String>,
         result: Result<netraze_protocols::kerberos::KerberosAssessmentOutcome, String>,
+        ticket: Option<netraze_protocols::kerberos::TicketGrantingTicket>,
     },
     BloodHoundProgress {
         endpoint: String,
@@ -142,6 +143,8 @@ pub struct KerberosScanOptions {
     pub explicit_principals: Vec<String>,
     pub explicit_spns: Vec<netraze_protocols::kerberos::ServicePrincipalTarget>,
     pub inventories: HashMap<String, netraze_core::DirectoryInventory>,
+    pub ticket_path: Option<String>,
+    pub ticket_service_host: Option<String>,
 }
 
 #[derive(Debug)]
@@ -683,6 +686,221 @@ impl RuntimeServices {
         });
     }
 
+    /// Launch LDAP inventory with one exact imported `ldap/host` ticket.
+    /// Ticket bytes remain in the selected file and are never copied into a
+    /// workspace or runtime event.
+    pub fn spawn_ldap_ticket_scan(
+        &self,
+        raw_targets: Vec<String>,
+        ticket_path: String,
+        service_host: String,
+        threads: usize,
+        timeout_seconds: u64,
+    ) {
+        let tx = self.log_tx.clone();
+        self.runtime.spawn(async move {
+            let _ = tx.send(RuntimeEvent::ScanStarted {
+                target_label: raw_targets.join(", "),
+            });
+            let targets = raw_targets
+                .iter()
+                .flat_map(|target| parse_target_list(target))
+                .collect::<Vec<_>>();
+            let cache = match netraze_protocols::kerberos::import_ticket_file(&ticket_path) {
+                Ok(cache) => cache,
+                Err(error) => {
+                    let _ = tx.send(RuntimeEvent::Log {
+                        level: LogLevel::Error,
+                        message: format!("Kerberos ticket import failed: {error}"),
+                    });
+                    let _ = tx.send(RuntimeEvent::ScanFinished);
+                    return;
+                }
+            };
+            let selector = netraze_protocols::kerberos::TicketSelector {
+                service_principal: Some(format!("ldap/{service_host}")),
+                ..netraze_protocols::kerberos::TicketSelector::default()
+            };
+            let ticket = match cache
+                .select(&selector)
+                .and_then(netraze_protocols::kerberos::KerberosTicket::to_service_ticket)
+            {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    let _ = tx.send(RuntimeEvent::Log {
+                        level: LogLevel::Error,
+                        message: format!(
+                            "Kerberos ticket selection for ldap/{service_host} failed: {error}"
+                        ),
+                    });
+                    let _ = tx.send(RuntimeEvent::ScanFinished);
+                    return;
+                }
+            };
+            let label = format!(
+                "{}@{} (Kerberos)",
+                ticket.client_principal(),
+                ticket.realm()
+            );
+            let timeout = Duration::from_secs(timeout_seconds.max(1));
+            let total = targets.len();
+            let mut completed = 0_usize;
+            for batch in targets.chunks(threads.max(1)) {
+                let mut tasks = JoinSet::new();
+                for target in batch {
+                    let endpoint = netraze_protocols::targets::with_default_port(target, 389);
+                    let ticket = ticket.clone();
+                    let service_host = service_host.clone();
+                    let label = label.clone();
+                    tasks.spawn(async move {
+                        let mut config = netraze_protocols::ldap::LdapClientConfig::new(&endpoint);
+                        config.connect_timeout = timeout;
+                        config.operation_timeout = timeout;
+                        let result = netraze_protocols::ldap::inventory_with_authentication(
+                            config,
+                            netraze_protocols::ldap::LdapAuthentication::Kerberos {
+                                service_host,
+                                ticket: Box::new(ticket),
+                            },
+                        )
+                        .await
+                        .map_err(|error| error.to_string());
+                        (endpoint, label, result)
+                    });
+                }
+                while let Some(joined) = tasks.join_next().await {
+                    completed += 1;
+                    match joined {
+                        Ok((endpoint, label, result)) => {
+                            let (level, message) = match &result {
+                                Ok(inventory) => (
+                                    LogLevel::Success,
+                                    format!(
+                                        "{endpoint}: LDAP Kerberos discovery completed ({} users, {} groups, {} computers)",
+                                        inventory.users.items.len(),
+                                        inventory.groups.items.len(),
+                                        inventory.computers.items.len()
+                                    ),
+                                ),
+                                Err(error) => (
+                                    LogLevel::Error,
+                                    format!("{endpoint}: LDAP Kerberos discovery failed: {error}"),
+                                ),
+                            };
+                            let _ = tx.send(RuntimeEvent::Log { level, message });
+                            let _ = tx.send(RuntimeEvent::DirectoryResult {
+                                endpoint,
+                                cred_label: label,
+                                result: Box::new(result),
+                            });
+                        }
+                        Err(error) => {
+                            let _ = tx.send(RuntimeEvent::Log {
+                                level: LogLevel::Error,
+                                message: format!("LDAP Kerberos task failed: {error}"),
+                            });
+                        }
+                    }
+                    let _ = tx.send(RuntimeEvent::ScanProgress {
+                        done: completed,
+                        total,
+                    });
+                }
+            }
+            let _ = tx.send(RuntimeEvent::ScanFinished);
+        });
+    }
+
+    /// Launch a read-only SMB scan with one exact imported `cifs/host`
+    /// ticket. SRVSVC share enumeration rides the authenticated SMB session.
+    pub fn spawn_smb_ticket_scan(
+        &self,
+        raw_targets: Vec<String>,
+        ticket_path: String,
+        service_host: String,
+        _timeout_seconds: u64,
+    ) {
+        let tx = self.log_tx.clone();
+        self.runtime.spawn(async move {
+            let _ = tx.send(RuntimeEvent::ScanStarted {
+                target_label: raw_targets.join(", "),
+            });
+            let targets = raw_targets
+                .iter()
+                .flat_map(|target| parse_target_list(target))
+                .collect::<Vec<_>>();
+            let cache = match netraze_protocols::kerberos::import_ticket_file(&ticket_path) {
+                Ok(cache) => cache,
+                Err(error) => {
+                    let _ = tx.send(RuntimeEvent::Log {
+                        level: LogLevel::Error,
+                        message: format!("Kerberos ticket import failed: {error}"),
+                    });
+                    let _ = tx.send(RuntimeEvent::ScanFinished);
+                    return;
+                }
+            };
+            let selector = netraze_protocols::kerberos::TicketSelector {
+                service_principal: Some(format!("cifs/{service_host}")),
+                ..netraze_protocols::kerberos::TicketSelector::default()
+            };
+            let ticket = match cache
+                .select(&selector)
+                .and_then(netraze_protocols::kerberos::KerberosTicket::to_service_ticket)
+            {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    let _ = tx.send(RuntimeEvent::Log {
+                        level: LogLevel::Error,
+                        message: format!(
+                            "Kerberos ticket selection for cifs/{service_host} failed: {error}"
+                        ),
+                    });
+                    let _ = tx.send(RuntimeEvent::ScanFinished);
+                    return;
+                }
+            };
+            let label = format!(
+                "{}@{} (Kerberos)",
+                ticket.client_principal(),
+                ticket.realm()
+            );
+            let total = targets.len();
+            for (index, target) in targets.into_iter().enumerate() {
+                let _ = tx.send(RuntimeEvent::SmbHostDiscovered {
+                    target: target.clone(),
+                });
+                let mut client =
+                    SmbClient::new(&target).with_kerberos(&service_host, ticket.clone());
+                let result = client.full_scan().await;
+                let level = if result.error.is_none() {
+                    LogLevel::Success
+                } else {
+                    LogLevel::Error
+                };
+                let message = result.error.as_ref().map_or_else(
+                    || {
+                        format!(
+                            "{target}: SMB Kerberos scan completed ({} shares)",
+                            result.shares.len()
+                        )
+                    },
+                    |error| format!("{target}: SMB Kerberos scan failed: {error}"),
+                );
+                let _ = tx.send(RuntimeEvent::Log { level, message });
+                let _ = tx.send(RuntimeEvent::SmbResult {
+                    result: Box::new(result),
+                    credential_label: Some(label.clone()),
+                });
+                let _ = tx.send(RuntimeEvent::ScanProgress {
+                    done: index + 1,
+                    total,
+                });
+            }
+            let _ = tx.send(RuntimeEvent::ScanFinished);
+        });
+    }
+
     /// Run bounded Kerberos exposure checks against each selected KDC. LDAP
     /// inventory is reused from the workflow when available and otherwise
     /// collected with the same selected password/NT-hash credential.
@@ -730,6 +948,7 @@ impl RuntimeServices {
                             realm: options.realm.clone().unwrap_or_default(),
                             cred_label: None,
                             result: Err(error),
+                            ticket: None,
                         });
                         let _ = tx.send(RuntimeEvent::ScanProgress {
                             done: index + 1,
@@ -738,7 +957,19 @@ impl RuntimeServices {
                         continue;
                     }
                 };
-                let label = credential.as_ref().map(crate::state::cred_label);
+                let label = credential.as_ref().map(crate::state::cred_label).or_else(|| {
+                    options.ticket_path.as_ref().and_then(|path| {
+                        netraze_protocols::kerberos::import_ticket_file(path)
+                            .ok()
+                            .map(|cache| {
+                                format!(
+                                    "{}@{} (Kerberos)",
+                                    cache.primary_principal(),
+                                    cache.primary_realm()
+                                )
+                            })
+                    })
+                });
                 let result = run_kerberos_assessment(
                     target,
                     &endpoint,
@@ -747,13 +978,14 @@ impl RuntimeServices {
                     Duration::from_secs(timeout_seconds.max(1)),
                 )
                 .await;
-                let (realm, result) = match result {
-                    Ok((realm, outcome)) => (realm, Ok(outcome)),
+                let (realm, result, ticket) = match result {
+                    Ok((realm, outcome, ticket)) => (realm, Ok(outcome), ticket),
                     Err(error) => (
                         options.realm.clone().unwrap_or_default(),
                         Err(credential.as_ref().map_or(error.clone(), |value| {
                             redact_secret(&error, &value.secret)
                         })),
+                        None,
                     ),
                 };
                 let (level, message) = match &result {
@@ -776,6 +1008,7 @@ impl RuntimeServices {
                     realm,
                     cred_label: label,
                     result,
+                    ticket,
                 });
                 let _ = tx.send(RuntimeEvent::ScanProgress {
                     done: index + 1,
@@ -1756,6 +1989,7 @@ async fn run_kerberos_assessment(
     (
         String,
         netraze_protocols::kerberos::KerberosAssessmentOutcome,
+        Option<netraze_protocols::kerberos::TicketGrantingTicket>,
     ),
     String,
 > {
@@ -1766,10 +2000,49 @@ async fn run_kerberos_assessment(
 
     let host_key = netraze_protocols::targets::endpoint_host(target).to_ascii_lowercase();
     let mut outcome = netraze_protocols::kerberos::KerberosAssessmentOutcome::default();
+    let mut acquired_tgt = None;
     let mut inventory = options.inventories.get(&host_key).cloned();
+    let ticket_cache = options
+        .ticket_path
+        .as_ref()
+        .map(netraze_protocols::kerberos::import_ticket_file)
+        .transpose()
+        .map_err(|error| format!("Kerberos ticket import failed: {error}"))?;
 
     if options.use_ldap_discovery && inventory.is_none() {
-        if let Some(credential) = credential {
+        if let Some(cache) = &ticket_cache {
+            let service_host = options.ticket_service_host.as_deref().ok_or_else(|| {
+                "Ticket-backed LDAP discovery requires the exact LDAP service host".to_owned()
+            })?;
+            let service_ticket = cache
+                .select(&netraze_protocols::kerberos::TicketSelector {
+                    service_principal: Some(format!("ldap/{service_host}")),
+                    ..netraze_protocols::kerberos::TicketSelector::default()
+                })
+                .and_then(netraze_protocols::kerberos::KerberosTicket::to_service_ticket)
+                .map_err(|error| {
+                    format!("No current ldap/{service_host} ticket is available: {error}")
+                })?;
+            let ldap_endpoint = netraze_protocols::targets::with_default_port(target, 389);
+            let mut config = netraze_protocols::ldap::LdapClientConfig::new(&ldap_endpoint);
+            config.connect_timeout = timeout;
+            config.operation_timeout = timeout;
+            match netraze_protocols::ldap::inventory_with_authentication(
+                config,
+                netraze_protocols::ldap::LdapAuthentication::Kerberos {
+                    service_host: service_host.to_owned(),
+                    ticket: Box::new(service_ticket),
+                },
+            )
+            .await
+            {
+                Ok(value) => inventory = Some(value),
+                Err(error) => outcome.errors.push(KerberosTargetError {
+                    target: ldap_endpoint,
+                    message: error.to_string(),
+                }),
+            }
+        } else if let Some(credential) = credential {
             match cred_to_ldap_auth(credential) {
                 Ok(authentication) => {
                     let ldap_endpoint = netraze_protocols::targets::with_default_port(target, 389);
@@ -1814,6 +2087,11 @@ async fn run_kerberos_assessment(
                 .filter(|value| !value.is_empty())
                 .map(str::to_ascii_uppercase)
         })
+        .or_else(|| {
+            ticket_cache
+                .as_ref()
+                .map(|cache| cache.primary_realm().to_ascii_uppercase())
+        })
         .ok_or_else(|| {
             "Kerberos realm is required when it cannot be derived from LDAP or the credential domain"
                 .to_owned()
@@ -1848,7 +2126,28 @@ async fn run_kerberos_assessment(
     }
 
     if options.assess_spns && !targets.service_principals.is_empty() {
-        if let Some(credential_record) = credential {
+        if let Some(cache) = &ticket_cache {
+            match cache
+                .select(&netraze_protocols::kerberos::TicketSelector {
+                    realm: Some(realm.clone()),
+                    ..netraze_protocols::kerberos::TicketSelector::default()
+                })
+                .and_then(netraze_protocols::kerberos::KerberosTicket::to_tgt)
+            {
+                Ok(tgt) => {
+                    let assessed = client
+                        .assess_spns(&tgt, &targets.service_principals)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    outcome.merge(assessed);
+                    acquired_tgt = Some(tgt);
+                }
+                Err(error) => outcome.errors.push(KerberosTargetError {
+                    target: "Kerberoast ticket authentication".to_owned(),
+                    message: error.to_string(),
+                }),
+            }
+        } else if let Some(credential_record) = credential {
             match cred_to_kerberos(credential_record) {
                 Ok(kerberos_credential) => match client
                     .request_tgt(&credential_record.username, &kerberos_credential)
@@ -1860,6 +2159,7 @@ async fn run_kerberos_assessment(
                             .await
                             .map_err(|error| error.to_string())?;
                         outcome.merge(assessed);
+                        acquired_tgt = Some(tgt);
                     }
                     Err(error) => outcome.errors.push(KerberosTargetError {
                         target: credential_record.username.clone(),
@@ -1879,7 +2179,7 @@ async fn run_kerberos_assessment(
         }
     }
 
-    Ok((realm, outcome))
+    Ok((realm, outcome, acquired_tgt))
 }
 
 pub(crate) fn realm_from_inventory(inventory: &netraze_core::DirectoryInventory) -> Option<String> {

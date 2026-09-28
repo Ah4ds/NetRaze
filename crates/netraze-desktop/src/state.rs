@@ -159,6 +159,7 @@ pub struct CredentialConfig {
     pub ntlm_hash: String,
     pub kerberos_aes_key: String,
     pub kerberos_ticket: String,
+    pub kerberos_service_host: String,
 }
 
 impl CredentialConfig {
@@ -410,6 +411,9 @@ pub struct AppState {
     /// Sensitive roast lines are session-only and never included in a
     /// workspace save. Persisted Kerberos nodes contain safe metadata only.
     pub kerberos_artifacts: HashMap<String, Vec<netraze_protocols::kerberos::RoastArtifact>>,
+    /// Reusable TGT/session-key material is session-only. Workspace saves keep
+    /// only the selected import path, never this cache.
+    pub kerberos_tickets: HashMap<String, netraze_protocols::kerberos::TicketCache>,
     pub pending_logins: Vec<(String, CredentialRecord)>,
     /// (host_node_id_raw, ip, hostname, credential)
     pub pending_share_enums: Vec<(usize, String, String, CredentialRecord)>,
@@ -461,6 +465,7 @@ impl AppState {
                 ntlm_hash: String::new(),
                 kerberos_aes_key: String::new(),
                 kerberos_ticket: String::new(),
+                kerberos_service_host: String::new(),
             },
             kerberos_config: KerberosScanConfig::default(),
             status_text: "Idle".to_owned(),
@@ -474,6 +479,7 @@ impl AppState {
             progress_message: String::new(),
             bloodhound_exports: HashMap::new(),
             kerberos_artifacts: HashMap::new(),
+            kerberos_tickets: HashMap::new(),
             pending_logins: Vec::new(),
             pending_share_enums: Vec::new(),
             pending_user_enums: Vec::new(),
@@ -1147,6 +1153,7 @@ impl AppState {
                     realm,
                     cred_label,
                     result,
+                    ticket,
                 } => {
                     let host_target = netraze_protocols::targets::endpoint_host(&endpoint);
                     let (findings, errors, error, artifacts) = match result {
@@ -1162,6 +1169,14 @@ impl AppState {
                         self.kerberos_artifacts.insert(endpoint.clone(), artifacts);
                     } else {
                         self.kerberos_artifacts.remove(&endpoint);
+                    }
+                    if let Some(ticket) = ticket {
+                        self.kerberos_tickets.insert(
+                            endpoint.clone(),
+                            netraze_protocols::kerberos::TicketCache::from_tgt(&ticket),
+                        );
+                    } else {
+                        self.kerberos_tickets.remove(&endpoint);
                     }
 
                     let host_id = self
@@ -1519,6 +1534,12 @@ pub struct WorkspaceSave {
     pub workflow: WorkflowDocument,
     pub logs: Vec<LogLine>,
     pub target_config: TargetConfigSave,
+    /// Ticket bytes are never embedded; only the operator-selected path and
+    /// exact service host survive a workspace reload.
+    #[serde(default)]
+    pub kerberos_ticket_path: String,
+    #[serde(default)]
+    pub kerberos_service_host: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1666,6 +1687,8 @@ impl AppState {
                 target: self.target_config.target.clone(),
                 protocol: self.target_config.protocol.clone(),
             },
+            kerberos_ticket_path: self.credential_config.kerberos_ticket.clone(),
+            kerberos_service_host: self.credential_config.kerberos_service_host.clone(),
         }
     }
 
@@ -1676,10 +1699,13 @@ impl AppState {
         self.session_credentials.clear();
         self.bloodhound_exports.clear();
         self.kerberos_artifacts.clear();
+        self.kerberos_tickets.clear();
         self.networks = save.networks;
         self.logs = save.logs;
         self.target_config.target = save.target_config.target;
         self.target_config.protocol = save.target_config.protocol;
+        self.credential_config.kerberos_ticket = save.kerberos_ticket_path;
+        self.credential_config.kerberos_service_host = save.kerberos_service_host;
 
         // Workspaces created before host/endpoint separation stored an LDAP
         // endpoint (for example `dc:389`) as the HostNode identity. Migrate
@@ -1964,6 +1990,7 @@ mod user_enum_tests {
             endpoint: "127.0.0.1:88".to_owned(),
             realm: "EXAMPLE.TEST".to_owned(),
             cred_label: Some("EXAMPLE\\alice".to_owned()),
+            ticket: None,
             result: Ok(netraze_protocols::kerberos::KerberosAssessmentOutcome {
                 findings: vec![netraze_core::KerberosFinding {
                     kind: netraze_core::KerberosFindingKind::AsRepRoast,
@@ -1994,6 +2021,32 @@ mod user_enum_tests {
         let workspace = serde_json::to_string(&state.to_save()).unwrap();
         assert!(workspace.contains("roastable"));
         assert!(!workspace.contains("krb5asrep"));
+    }
+
+    #[test]
+    fn workspace_persists_ticket_location_but_never_session_ticket_material() {
+        let (mut state, _host_id, _tx) = state_with_host();
+        state.credential_config.kerberos_ticket = "/run/user/1000/alice.ccache".to_owned();
+        state.credential_config.kerberos_service_host = "dc.example.test".to_owned();
+
+        let serialized = serde_json::to_string(&state.to_save()).unwrap();
+        assert!(serialized.contains("/run/user/1000/alice.ccache"));
+        assert!(serialized.contains("dc.example.test"));
+        assert!(!serialized.contains("kerberos_tickets"));
+        assert!(!serialized.contains("session_key"));
+
+        let save: WorkspaceSave = serde_json::from_str(&serialized).unwrap();
+        let (mut restored, _host_id, _tx) = state_with_host();
+        restored.load_from(save);
+        assert_eq!(
+            restored.credential_config.kerberos_ticket,
+            "/run/user/1000/alice.ccache"
+        );
+        assert_eq!(
+            restored.credential_config.kerberos_service_host,
+            "dc.example.test"
+        );
+        assert!(restored.kerberos_tickets.is_empty());
     }
 
     #[test]

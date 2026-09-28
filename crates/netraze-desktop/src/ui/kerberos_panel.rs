@@ -6,6 +6,7 @@ use crate::theme;
 pub enum KerberosAction {
     None,
     ExportHashcat,
+    ExportTicket,
 }
 
 pub struct KerberosView<'a> {
@@ -16,6 +17,7 @@ pub struct KerberosView<'a> {
     pub error: Option<&'a str>,
     pub cred_label: Option<&'a str>,
     pub artifacts_available: bool,
+    pub ticket_available: bool,
 }
 
 pub fn show(ui: &mut egui::Ui, view: KerberosView<'_>) -> KerberosAction {
@@ -132,6 +134,15 @@ pub fn show(ui: &mut egui::Ui, view: KerberosView<'_>) -> KerberosAction {
         .clicked()
     {
         action = KerberosAction::ExportHashcat;
+    }
+    if ui
+        .add_enabled(
+            view.ticket_available,
+            egui::Button::new("Export TGT as ccache/kirbi…"),
+        )
+        .clicked()
+    {
+        action = KerberosAction::ExportTicket;
     }
     ui.label(
         egui::RichText::new(if view.artifacts_available {

@@ -127,6 +127,10 @@ where
             domain,
             credential,
         } => client.bind_ntlm(&username, &domain, credential).await,
+        LdapAuthentication::Kerberos {
+            service_host,
+            ticket,
+        } => client.bind_kerberos(&service_host, &ticket).await,
     };
     if let Err(error) = bind_result {
         let _ = client.unbind().await;

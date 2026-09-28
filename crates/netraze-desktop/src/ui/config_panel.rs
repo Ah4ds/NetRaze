@@ -118,15 +118,43 @@ fn show_default_config(ui: &mut egui::Ui, state: &mut AppState, runtime: &Runtim
             .small()
             .color(LABEL_COLOR),
     );
-    ui.add(
-        egui::TextEdit::singleline(&mut state.credential_config.kerberos_ticket)
-            .desired_width(f32::INFINITY)
-            .font(egui::TextStyle::Monospace),
-    );
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(&mut state.credential_config.kerberos_ticket)
+                .hint_text("ccache or .kirbi path")
+                .desired_width(ui.available_width() - 72.0)
+                .font(egui::TextStyle::Monospace),
+        );
+        if ui.button("Browse…").clicked()
+            && let Some(path) = rfd::FileDialog::new()
+                .add_filter("Kerberos tickets", &["ccache", "kirbi"])
+                .pick_file()
+        {
+            state.credential_config.kerberos_ticket = path.display().to_string();
+        }
+    });
+    if !state.credential_config.kerberos_ticket.trim().is_empty()
+        && matches!(
+            state.target_config.protocol.as_str(),
+            "SMB" | "LDAP" | "Kerberos"
+        )
+    {
+        ui.label(
+            egui::RichText::new("Ticket service host")
+                .small()
+                .color(LABEL_COLOR),
+        );
+        ui.add(
+            egui::TextEdit::singleline(&mut state.credential_config.kerberos_service_host)
+                .hint_text("dc01.example.test")
+                .desired_width(f32::INFINITY)
+                .font(egui::TextStyle::Monospace),
+        );
+    }
     if state.target_config.protocol == "SMB" || state.target_config.protocol == "LDAP" {
         ui.label(
                 egui::RichText::new(
-                    "Use DOMAIN\\username when a domain is needed. NT hash takes priority over Password. Kerberos tickets are not supported yet.",
+                    "Use DOMAIN\\username when a domain is needed. NT hash takes priority over Password. A ticket path selects exact cifs/host or ldap/host authentication and does not fall back to NTLM.",
                 )
                 .small()
                 .color(LABEL_COLOR),
@@ -309,6 +337,15 @@ fn show_default_config(ui: &mut egui::Ui, state: &mut AppState, runtime: &Runtim
             .collect();
 
         match state.target_config.protocol.as_str() {
+            "LDAP" if !state.credential_config.kerberos_ticket.trim().is_empty() => {
+                runtime.spawn_ldap_ticket_scan(
+                    targets,
+                    state.credential_config.kerberos_ticket.clone(),
+                    state.credential_config.kerberos_service_host.clone(),
+                    state.threads,
+                    state.timeout_seconds,
+                );
+            }
             "LDAP" => match state.credential_config.as_record() {
                 Ok(mut record) => {
                     if let Some(credential) = &mut record {
@@ -326,6 +363,14 @@ fn show_default_config(ui: &mut egui::Ui, state: &mut AppState, runtime: &Runtim
                     runtime.emit_error(error);
                 }
             },
+            "SMB" if !state.credential_config.kerberos_ticket.trim().is_empty() => {
+                runtime.spawn_smb_ticket_scan(
+                    targets,
+                    state.credential_config.kerberos_ticket.clone(),
+                    state.credential_config.kerberos_service_host.clone(),
+                    state.timeout_seconds,
+                );
+            }
             "SMB" => match state.credential_config.as_record() {
                 Ok(mut record) => {
                     if let Some(credential) = &mut record {
@@ -343,7 +388,11 @@ fn show_default_config(ui: &mut egui::Ui, state: &mut AppState, runtime: &Runtim
                     runtime.emit_error(error);
                 }
             },
-            "Kerberos" => match state.credential_config.as_kerberos_record() {
+            "Kerberos" => match if state.credential_config.kerberos_ticket.trim().is_empty() {
+                state.credential_config.as_kerberos_record()
+            } else {
+                Ok(None)
+            } {
                 Ok(mut record) => {
                     if let Some(credential) = &mut record {
                         credential.protocol = "Kerberos".to_owned();
@@ -392,6 +441,10 @@ fn show_default_config(ui: &mut egui::Ui, state: &mut AppState, runtime: &Runtim
                             }
                         },
                         inventories,
+                        ticket_path: nonempty(&state.credential_config.kerberos_ticket),
+                        ticket_service_host: nonempty(
+                            &state.credential_config.kerberos_service_host,
+                        ),
                     };
                     runtime.spawn_kerberos_scan(targets, plan, options, state.timeout_seconds);
                 }
@@ -427,8 +480,15 @@ fn scan_validation_error(state: &AppState) -> Option<String> {
     if state.target_config.target.trim().is_empty() {
         return Some("Enter at least one host, range, or CIDR target".to_owned());
     }
+    if !state.credential_config.kerberos_ticket.trim().is_empty()
+        && let Err(error) = validate_ticket_configuration(state)
+    {
+        return Some(error);
+    }
     match state.target_config.protocol.as_str() {
+        "SMB" if !state.credential_config.kerberos_ticket.trim().is_empty() => None,
         "SMB" => state.credential_config.as_record().err(),
+        "LDAP" if !state.credential_config.kerberos_ticket.trim().is_empty() => None,
         "LDAP" => {
             let credential = match state.credential_config.as_record() {
                 Ok(Some(credential)) => credential,
@@ -458,11 +518,53 @@ fn scan_validation_error(state: &AppState) -> Option<String> {
             if let Err(error) = parse_spns(&state.kerberos_config.explicit_spns) {
                 return Some(error);
             }
-            state.credential_config.as_kerberos_record().err()
+            if state.credential_config.kerberos_ticket.trim().is_empty() {
+                state.credential_config.as_kerberos_record().err()
+            } else {
+                None
+            }
         }
         protocol => Some(format!(
             "Protocol {protocol} does not have a desktop scan workflow yet"
         )),
+    }
+}
+
+fn validate_ticket_configuration(state: &AppState) -> Result<(), String> {
+    let path = state.credential_config.kerberos_ticket.trim();
+    let cache = netraze_protocols::kerberos::import_ticket_file(path)
+        .map_err(|error| format!("Invalid Kerberos ticket file: {error}"))?;
+    match state.target_config.protocol.as_str() {
+        "SMB" | "LDAP" => {
+            let host = state.credential_config.kerberos_service_host.trim();
+            if host.is_empty() {
+                return Err("Enter the exact DNS service host for the imported ticket".to_owned());
+            }
+            let service = if state.target_config.protocol == "SMB" {
+                "cifs"
+            } else {
+                "ldap"
+            };
+            cache
+                .select(&netraze_protocols::kerberos::TicketSelector {
+                    service_principal: Some(format!("{service}/{host}")),
+                    ..netraze_protocols::kerberos::TicketSelector::default()
+                })
+                .and_then(netraze_protocols::kerberos::KerberosTicket::to_service_ticket)
+                .map(|_| ())
+                .map_err(|error| {
+                    format!("Ticket file has no current exact {service}/{host} ticket: {error}")
+                })
+        }
+        "Kerberos" => cache
+            .select(&netraze_protocols::kerberos::TicketSelector {
+                realm: nonempty(&state.kerberos_config.realm),
+                ..netraze_protocols::kerberos::TicketSelector::default()
+            })
+            .and_then(netraze_protocols::kerberos::KerberosTicket::to_tgt)
+            .map(|_| ())
+            .map_err(|error| format!("Ticket file has no current TGT for this realm: {error}")),
+        _ => Err("Kerberos ticket paths are supported only for SMB, LDAP, and Kerberos".to_owned()),
     }
 }
 
@@ -527,6 +629,41 @@ fn export_kerberos_artifacts(state: &mut AppState, runtime: &RuntimeServices, en
     }
 }
 
+fn export_kerberos_ticket(state: &AppState, runtime: &RuntimeServices, endpoint: &str) {
+    let Some(path) = rfd::FileDialog::new()
+        .set_title("Export Kerberos TGT")
+        .add_filter("MIT ccache", &["ccache"])
+        .add_filter("KRB-CRED kirbi", &["kirbi"])
+        .set_file_name("netraze-ticket.ccache")
+        .save_file()
+    else {
+        return;
+    };
+    let Some(cache) = state.kerberos_tickets.get(endpoint) else {
+        runtime.emit_error("Kerberos TGT is no longer available; run the assessment again");
+        return;
+    };
+    let format = if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("kirbi"))
+    {
+        netraze_protocols::kerberos::TicketFileFormat::Kirbi
+    } else {
+        netraze_protocols::kerberos::TicketFileFormat::CcacheV4
+    };
+    match netraze_protocols::kerberos::export_ticket_file(&path, cache, format, true) {
+        Ok(()) => runtime.emit_log(
+            crate::runtime::LogLevel::Success,
+            format!("{endpoint}: exported Kerberos TGT to {}", path.display()),
+        ),
+        Err(error) => runtime.emit_error(format!(
+            "{endpoint}: Kerberos TGT export failed for {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 // ── Per-node detail panel ─────────────────────────────────────────────────────
 
 fn show_node_panel(
@@ -550,6 +687,7 @@ fn show_node_panel(
             .kerberos_artifacts
             .get(endpoint)
             .is_some_and(|artifacts| !artifacts.is_empty());
+        let ticket_available = state.kerberos_tickets.contains_key(endpoint);
         let action = super::kerberos_panel::show(
             ui,
             super::kerberos_panel::KerberosView {
@@ -560,11 +698,18 @@ fn show_node_panel(
                 error: error.as_deref(),
                 cred_label: cred_label.as_deref(),
                 artifacts_available,
+                ticket_available,
             },
         );
         let endpoint = endpoint.clone();
-        if action == super::kerberos_panel::KerberosAction::ExportHashcat {
-            export_kerberos_artifacts(state, runtime, &endpoint);
+        match action {
+            super::kerberos_panel::KerberosAction::ExportHashcat => {
+                export_kerberos_artifacts(state, runtime, &endpoint);
+            }
+            super::kerberos_panel::KerberosAction::ExportTicket => {
+                export_kerberos_ticket(state, runtime, &endpoint);
+            }
+            super::kerberos_panel::KerberosAction::None => {}
         }
         return;
     }
