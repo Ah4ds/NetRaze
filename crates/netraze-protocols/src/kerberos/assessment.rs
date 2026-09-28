@@ -331,6 +331,37 @@ impl ServiceTicket {
         self.ticket_flags
     }
 
+    /// Require this ticket to name exactly `service/host`. The connection
+    /// address is intentionally separate: callers may connect through a
+    /// loopback port or an IP, but must explicitly name the authenticated
+    /// DNS service and may not silently substitute identities.
+    pub fn validate_service_target(&self, service: &str, host: &str) -> Result<(), KerberosError> {
+        let service = service.trim();
+        let host = host.trim().trim_end_matches('.');
+        if service.is_empty()
+            || host.is_empty()
+            || service.contains(['/', '@'])
+            || host.contains(['/', '@', '\\'])
+        {
+            return Err(KerberosError::InvalidMessage(
+                "Kerberos service target is invalid".to_owned(),
+            ));
+        }
+        let mut components = self.service_principal_name.split('/');
+        let ticket_service = components.next().unwrap_or_default();
+        let ticket_host = components.next().unwrap_or_default().trim_end_matches('.');
+        if components.next().is_some()
+            || !ticket_service.eq_ignore_ascii_case(service)
+            || !ticket_host.eq_ignore_ascii_case(host)
+        {
+            return Err(KerberosError::InvalidMessage(format!(
+                "service ticket is for {}, not {service}/{host}",
+                self.service_principal_name
+            )));
+        }
+        Ok(())
+    }
+
     pub fn roast_artifact(&self, account: &str) -> Result<RoastArtifact, KerberosError> {
         validate_hash_field(account, "account")?;
         format_tgs_artifact(
@@ -1185,6 +1216,9 @@ mod tests {
             ticket.roast_artifact("svc").unwrap().finding.hashcat_mode,
             19_700
         );
+        assert!(ticket.validate_service_target("http", "WEB").is_ok());
+        assert!(ticket.validate_service_target("ldap", "web").is_err());
+        assert!(ticket.validate_service_target("http", "other").is_err());
     }
 
     #[test]

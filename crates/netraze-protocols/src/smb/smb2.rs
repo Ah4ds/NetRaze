@@ -9,6 +9,8 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
+use crate::kerberos::{KerberosGssInitiator, ServiceTicket};
+
 use super::ntlm;
 
 const SMB2_MAGIC: &[u8; 4] = b"\xfeSMB";
@@ -147,6 +149,11 @@ pub struct Smb2Session {
     /// for DCE/RPC PKT_PRIVACY over the named-pipe transport. `None` until
     /// the handshake completes; cleared by `logoff`.
     session_key: Option<[u8; 16]>,
+    /// SMB2 signing key established by the selected authentication
+    /// mechanism. NTLM uses its 16-byte exported session key; Kerberos uses
+    /// the negotiated GSS context key and deliberately does not populate the
+    /// NTLM-only `session_key` above.
+    signing_key: Option<Vec<u8>>,
     /// Set from the server's Negotiate response SecurityMode bit
     /// `SMB2_NEGOTIATE_SIGNING_REQUIRED (0x0002)` — see [MS-SMB2 §2.2.4].
     /// Domain controllers always set it. When true, every post-session-setup
@@ -272,6 +279,22 @@ impl Smb2Session {
         Ok(session)
     }
 
+    /// Connect with an acquired `cifs/host` service ticket. The service's
+    /// AP-REP is validated before its GSS context key is enabled for SMB2
+    /// signing. This method never falls back to NTLM or guest access.
+    pub fn connect_with_kerberos(
+        target: &str,
+        service_host: &str,
+        ticket: &ServiceTicket,
+    ) -> Result<Self, String> {
+        ticket
+            .validate_service_target("cifs", service_host)
+            .map_err(|error| error.to_string())?;
+        let mut session = Self::handshake_transport(target)?;
+        session.session_setup_kerberos(ticket)?;
+        Ok(session)
+    }
+
     /// TCP connect + negotiate — the transport half every `connect_*`
     /// variant shares.
     ///
@@ -297,6 +320,7 @@ impl Smb2Session {
             session_id: 0,
             message_id: 0,
             session_key: None,
+            signing_key: None,
             signing_required: false,
         };
         session.negotiate()?;
@@ -1036,6 +1060,7 @@ impl Smb2Session {
         // valid to seal with anyway, and we don't want a stale key sitting
         // in memory after the session is closed.
         self.session_key = None;
+        self.signing_key = None;
     }
 
     /// NTLMv2 ExportedSessionKey for this session, or `None` if the handshake
@@ -1223,7 +1248,49 @@ impl Smb2Session {
         // back via `exported_session_key()` to build its NTLMSSP authenticator.
         // Null sessions have none — signing/sealing stay off.
         self.session_key = exported_session_key;
+        self.signing_key = exported_session_key.map(|key| key.to_vec());
 
+        Ok(())
+    }
+
+    fn session_setup_kerberos(&mut self, ticket: &ServiceTicket) -> Result<(), String> {
+        let (initiator, token) =
+            KerberosGssInitiator::start(ticket).map_err(|error| error.to_string())?;
+        let header = self.build_header(SMB2_SESSION_SETUP, 0);
+        let body = self.build_session_setup_body(&token);
+        let mut packet = Vec::with_capacity(header.len() + body.len() + token.len());
+        packet.extend_from_slice(&header);
+        packet.extend_from_slice(&body);
+        packet.extend_from_slice(&token);
+
+        self.send_packet(&packet)?;
+        let response = self.recv_packet()?;
+        let status = u32::from_le_bytes(response[8..12].try_into().unwrap());
+        if status != STATUS_SUCCESS {
+            return Err(format!("Kerberos Session Setup failed: 0x{status:08x}"));
+        }
+        self.session_id = u64::from_le_bytes(response[40..48].try_into().unwrap());
+        let server_token = session_setup_security_buffer(&response)?;
+        if server_token.is_empty() {
+            self.session_id = 0;
+            return Err("Kerberos Session Setup omitted the mutually authenticated AP-REP".into());
+        }
+        let context = initiator
+            .finish(server_token)
+            .map_err(|error| format!("Kerberos AP-REP validation failed: {error}"))?;
+
+        let session_flags = u16::from_le_bytes(
+            response[SMB2_HEADER_SIZE + 2..SMB2_HEADER_SIZE + 4]
+                .try_into()
+                .unwrap(),
+        );
+        if session_flags & 0x0003 != 0 {
+            self.session_id = 0;
+            return Err(
+                "Kerberos authentication was downgraded to a guest or anonymous SMB session".into(),
+            );
+        }
+        self.signing_key = Some(context.session_key().to_vec());
         Ok(())
     }
 
@@ -1265,10 +1332,10 @@ impl Smb2Session {
     /// Server *response* signatures are not verified — same deliberate
     /// choice Impacket makes; out of scope until something needs it.
     fn send_packet(&mut self, data: &[u8]) -> Result<(), String> {
-        let wire: Vec<u8> = match (self.signing_required, self.session_key) {
+        let wire: Vec<u8> = match (self.signing_required, self.signing_key.as_deref()) {
             (true, Some(key)) => {
                 let mut signed = data.to_vec();
-                sign_smb2_message(&mut signed, &key)?;
+                sign_smb2_message(&mut signed, key)?;
                 signed
             }
             _ => data.to_vec(),
@@ -1410,7 +1477,7 @@ const SMB2_FLAGS_SIGNED: u32 = 0x0000_0008;
 /// HMAC-SHA256 KDF and AES-CMAC of SMB 3.x don't apply, and we only
 /// offer dialects 0x0202/0x0210 in `negotiate`. Mirrors Impacket
 /// `smb3.py:signSMB`.
-fn sign_smb2_message(message: &mut [u8], session_key: &[u8; 16]) -> Result<(), String> {
+fn sign_smb2_message(message: &mut [u8], session_key: &[u8]) -> Result<(), String> {
     if message.len() < SMB2_HEADER_SIZE {
         return Err(format!(
             "cannot sign: message is {} bytes, shorter than the {}-byte SMB2 header",
@@ -1427,6 +1494,23 @@ fn sign_smb2_message(message: &mut [u8], session_key: &[u8; 16]) -> Result<(), S
     let mac = super::crypto::hmac_sha256(session_key, message)?;
     message[48..SMB2_HEADER_SIZE].copy_from_slice(&mac[..16]);
     Ok(())
+}
+
+/// Return the bounded security buffer from an SMB2 SESSION_SETUP response.
+/// Offsets are relative to the SMB2 header, not the command body.
+fn session_setup_security_buffer(response: &[u8]) -> Result<&[u8], String> {
+    if response.len() < SMB2_HEADER_SIZE + 8 {
+        return Err("Session Setup response too short".to_owned());
+    }
+    let body = &response[SMB2_HEADER_SIZE..];
+    let offset = usize::from(u16::from_le_bytes(body[4..6].try_into().unwrap()));
+    let length = usize::from(u16::from_le_bytes(body[6..8].try_into().unwrap()));
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| "Session Setup security buffer overflow".to_owned())?;
+    response
+        .get(offset..end)
+        .ok_or_else(|| "Session Setup security buffer out of bounds".to_owned())
 }
 
 /// Extract the server's signing-required preference from a Negotiate
@@ -2210,6 +2294,22 @@ mod signing_tests {
         msg[40..48].copy_from_slice(&0x11223344u64.to_le_bytes()); // SessionId
         msg[64..72].copy_from_slice(&[9, 0, 0, 0, 0, 0, 0, 0]); // body
         msg
+    }
+
+    #[test]
+    fn session_setup_security_buffer_is_bounds_checked() {
+        let mut response = vec![0_u8; SMB2_HEADER_SIZE + 8 + 3];
+        response[SMB2_HEADER_SIZE + 4..SMB2_HEADER_SIZE + 6]
+            .copy_from_slice(&((SMB2_HEADER_SIZE + 8) as u16).to_le_bytes());
+        response[SMB2_HEADER_SIZE + 6..SMB2_HEADER_SIZE + 8].copy_from_slice(&3_u16.to_le_bytes());
+        response[SMB2_HEADER_SIZE + 8..].copy_from_slice(&[1, 2, 3]);
+        assert_eq!(
+            session_setup_security_buffer(&response).unwrap(),
+            &[1, 2, 3]
+        );
+
+        response[SMB2_HEADER_SIZE + 6..SMB2_HEADER_SIZE + 8].copy_from_slice(&4_u16.to_le_bytes());
+        assert!(session_setup_security_buffer(&response).is_err());
     }
 
     /// Known-answer test for the SMB 2.0.2/2.1 signing MAC, cross-checked

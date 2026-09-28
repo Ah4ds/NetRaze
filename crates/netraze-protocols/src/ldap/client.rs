@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
 
+use crate::kerberos::{KerberosGssInitiator, KerberosSecurityContext, ServiceTicket};
 use crate::ntlm::{
     NegState, NtlmClient, NtlmCredential, NtlmSecurityContext, ntlm_mech_types_der,
     parse_neg_token_resp,
@@ -99,6 +100,8 @@ pub enum LdapError {
     Result { code: String, diagnostic: String },
     #[error("NTLM SASL bind failed: {0}")]
     Ntlm(String),
+    #[error("Kerberos SASL bind failed: {0}")]
+    Kerberos(String),
     #[error("LDAP client state error: {0}")]
     State(String),
 }
@@ -114,9 +117,38 @@ pub struct LdapClient {
     config: LdapClientConfig,
     next_message_id: u32,
     read_buffer: Vec<u8>,
-    security_context: Option<NtlmSecurityContext>,
+    security_context: Option<LdapSecurityContext>,
     anonymous_bound: bool,
     usable: bool,
+}
+
+enum LdapSecurityContext {
+    Ntlm(Box<NtlmSecurityContext>),
+    Kerberos(KerberosSecurityContext),
+}
+
+impl LdapSecurityContext {
+    fn wrap(&mut self, plaintext: &[u8]) -> Result<Vec<u8>, LdapError> {
+        match self {
+            Self::Ntlm(context) => context
+                .wrap(plaintext)
+                .map_err(|error| LdapError::Ntlm(error.to_string())),
+            Self::Kerberos(context) => context
+                .wrap(plaintext)
+                .map_err(|error| LdapError::Kerberos(error.to_string())),
+        }
+    }
+
+    fn unwrap(&mut self, ciphertext: &[u8]) -> Result<Vec<u8>, LdapError> {
+        match self {
+            Self::Ntlm(context) => context
+                .unwrap(ciphertext)
+                .map_err(|error| LdapError::Ntlm(error.to_string())),
+            Self::Kerberos(context) => context
+                .unwrap(ciphertext)
+                .map_err(|error| LdapError::Kerberos(error.to_string())),
+        }
+    }
 }
 
 impl core::fmt::Debug for LdapClient {
@@ -215,7 +247,45 @@ impl LdapClient {
                     .map_err(|error| LdapError::Ntlm(error.to_string()))?;
             }
         }
-        self.security_context = Some(context);
+        self.security_context = Some(LdapSecurityContext::Ntlm(Box::new(context)));
+        Ok(())
+    }
+
+    /// Authenticate with an acquired `ldap/host` service ticket. The AP-REP
+    /// is validated before the RFC 4121 sign-and-seal context becomes active.
+    pub async fn bind_kerberos(
+        &mut self,
+        service_host: &str,
+        ticket: &ServiceTicket,
+    ) -> Result<(), LdapError> {
+        if self.anonymous_bound || self.security_context.is_some() {
+            return Err(LdapError::State("connection is already bound".into()));
+        }
+        ticket
+            .validate_service_target("ldap", service_host)
+            .map_err(|error| LdapError::Kerberos(error.to_string()))?;
+        let (initiator, token) = KerberosGssInitiator::start(ticket)
+            .map_err(|error| LdapError::Kerberos(error.to_string()))?;
+        let first = self.bind_exchange(token).await?;
+        if !matches!(
+            first.result_code,
+            ResultCode::Success | ResultCode::SaslBindInProgress
+        ) {
+            return Err(result_error(first.result_code, &first.diagnostic_message));
+        }
+        let server_token = first.server_sasl_creds.ok_or_else(|| {
+            LdapError::Kerberos("server omitted the mutually authenticated AP-REP".to_owned())
+        })?;
+        let context = initiator
+            .finish(&server_token)
+            .map_err(|error| LdapError::Kerberos(error.to_string()))?;
+        if first.result_code == ResultCode::SaslBindInProgress {
+            let second = self.bind_exchange(Vec::new()).await?;
+            if second.result_code != ResultCode::Success {
+                return Err(result_error(second.result_code, &second.diagnostic_message));
+            }
+        }
+        self.security_context = Some(LdapSecurityContext::Kerberos(context));
         Ok(())
     }
 
@@ -501,9 +571,7 @@ impl LdapClient {
             });
         }
         let wire = if let Some(context) = self.security_context.as_mut() {
-            let protected = context
-                .wrap(&encoded)
-                .map_err(|error| LdapError::Ntlm(error.to_string()))?;
+            let protected = context.wrap(&encoded)?;
             if protected.len() > self.config.max_pdu_size {
                 return Err(LdapError::OversizedPdu {
                     length: protected.len(),
@@ -578,7 +646,7 @@ impl LdapClient {
                 Ok(plaintext) => plaintext,
                 Err(error) => {
                     self.usable = false;
-                    return Err(LdapError::Ntlm(error.to_string()));
+                    return Err(error);
                 }
             };
             let buffered_length = self.read_buffer.len().checked_add(plaintext.len()).ok_or(
@@ -1215,7 +1283,9 @@ mod tests {
         let mut client = LdapClient::connect(LdapClientConfig::new(address.to_string()))
             .await
             .unwrap();
-        client.security_context = Some(NtlmSecurityContext::new(key));
+        client.security_context = Some(LdapSecurityContext::Ntlm(Box::new(
+            NtlmSecurityContext::new(key),
+        )));
         let outcome = client
             .search(
                 "DC=example,DC=test",

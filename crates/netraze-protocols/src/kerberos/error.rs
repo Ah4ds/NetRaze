@@ -54,6 +54,10 @@ pub enum KerberosError {
     },
     #[error("Kerberos ciphertext integrity check failed")]
     Integrity,
+    #[error("invalid Kerberos GSS token: {0}")]
+    InvalidGssToken(String),
+    #[error("Kerberos GSS sequence mismatch: expected {expected}, received {actual}")]
+    GssSequence { expected: u64, actual: u64 },
     #[error("KDC returned error {code}{message}")]
     Kdc {
         code: i32,

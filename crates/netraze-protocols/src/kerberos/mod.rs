@@ -9,11 +9,13 @@ mod assessment;
 mod client;
 mod crypto;
 mod error;
+mod gss;
 mod ticket;
 mod transport;
 
 pub use crypto::{KerberosEncryptionType, decrypt, derive_password_key, encrypt};
 pub use error::KerberosError;
+pub use gss::{KerberosGssInitiator, KerberosSecurityContext};
 pub use ticket::{
     KerberosTicket, KerberosTicketKind, TicketCache, TicketFileFormat, TicketMetadata,
     TicketSelector, export_ticket_file, import_ticket_file,
