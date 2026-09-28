@@ -63,6 +63,7 @@ pub enum KerberosTicketKind {
 pub struct TicketMetadata {
     pub kind: KerberosTicketKind,
     pub client_principal: String,
+    pub client_realm: String,
     pub realm: String,
     pub service_principal: String,
     pub encryption_type: KerberosEncryptionType,
@@ -112,7 +113,8 @@ impl KerberosTicket {
             metadata: TicketMetadata {
                 kind: KerberosTicketKind::TicketGranting,
                 client_principal: ticket.client_principal.clone(),
-                realm: ticket.realm.clone(),
+                client_realm: ticket.realm.clone(),
+                realm: ticket.kdc_realm.clone(),
                 service_principal: principal_name(&ticket.ticket.0.sname.0),
                 encryption_type: ticket.session_encryption_type,
                 issued_at_unix: ticket.issued_at_unix,
@@ -132,6 +134,7 @@ impl KerberosTicket {
             metadata: TicketMetadata {
                 kind: KerberosTicketKind::Service,
                 client_principal: ticket.client_principal.clone(),
+                client_realm: ticket.client_realm.clone(),
                 realm: ticket.realm.clone(),
                 service_principal: ticket.service_principal_name.clone(),
                 encryption_type: ticket.session_encryption_type,
@@ -155,7 +158,8 @@ impl KerberosTicket {
             session_key: self.session_key.clone(),
             session_encryption_type: self.metadata.encryption_type,
             client_principal: self.metadata.client_principal.clone(),
-            realm: self.metadata.realm.clone(),
+            realm: self.metadata.client_realm.clone(),
+            kdc_realm: self.metadata.realm.clone(),
             issued_at_unix: self.metadata.issued_at_unix,
             valid_from_unix: self.metadata.valid_from_unix,
             valid_until_unix: self.metadata.valid_until_unix,
@@ -175,6 +179,7 @@ impl KerberosTicket {
             session_key: self.session_key.clone(),
             session_encryption_type: self.metadata.encryption_type,
             client_principal: self.metadata.client_principal.clone(),
+            client_realm: self.metadata.client_realm.clone(),
             service_principal_name: self.metadata.service_principal.clone(),
             realm: self.metadata.realm.clone(),
             issued_at_unix: self.metadata.issued_at_unix,
@@ -222,7 +227,7 @@ impl TicketCache {
     pub fn new(ticket: KerberosTicket) -> Self {
         Self {
             primary_principal: ticket.metadata.client_principal.clone(),
-            primary_realm: ticket.metadata.realm.clone(),
+            primary_realm: ticket.metadata.client_realm.clone(),
             tickets: vec![ticket],
         }
     }
@@ -455,7 +460,7 @@ fn encode_ccache(cache: &TicketCache) -> Result<Vec<u8>, KerberosError> {
         let metadata = ticket.metadata();
         ccache.credentials.push(Credential {
             client: Principal {
-                realm: metadata.realm.clone(),
+                realm: metadata.client_realm.clone(),
                 name_type: 1,
                 components: split_principal(&metadata.client_principal)?,
             },
@@ -591,8 +596,13 @@ fn make_ticket(imported: ImportedTicket) -> Result<KerberosTicket, KerberosError
         metadata: TicketMetadata {
             kind,
             client_principal,
+            client_realm: client_realm.clone(),
             realm: if kind == KerberosTicketKind::TicketGranting {
-                client_realm
+                service_principal
+                    .split('/')
+                    .nth(1)
+                    .unwrap_or(&client_realm)
+                    .to_ascii_uppercase()
             } else {
                 embedded_realm
             },
@@ -840,7 +850,7 @@ fn ticket_to_krb_cred_info(ticket: &KerberosTicket) -> Result<KrbCredInfo, Kerbe
             key_value: ExplicitContextTag1::from(OctetStringAsn1::from(ticket.session_key.clone())),
         }),
         prealm: Optional::from(Some(ExplicitContextTag1::from(kerberos_string(
-            &metadata.realm,
+            &metadata.client_realm,
         )?))),
         pname: Optional::from(Some(ExplicitContextTag2::from(principal_from_string(
             &metadata.client_principal,

@@ -1,5 +1,6 @@
 //! Kerberos Authentication Service exchange (RFC 4120 section 3.1).
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use picky_asn1::bit_string::BitString;
@@ -30,15 +31,77 @@ use time::OffsetDateTime;
 
 use super::crypto::{KerberosEncryptionType, decrypt, derive_password_key, encrypt};
 use super::transport::{
-    DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_RESPONSE_SIZE, DEFAULT_OPERATION_TIMEOUT,
+    DEFAULT_CONNECT_TIMEOUT, DEFAULT_MAX_RESPONSE_SIZE, DEFAULT_MAX_UDP_RESPONSE_SIZE,
+    DEFAULT_OPERATION_TIMEOUT, DEFAULT_UDP_TIMEOUT,
 };
-use super::{KdcTransport, KdcTransportConfig, KerberosError};
+use super::{KdcTransport, KdcTransportConfig, KdcTransportPolicy, KerberosError};
 
 const KERBEROS_VERSION: u8 = 5;
 const AS_REP_TAG: u8 = 0x6b;
 const KRB_ERROR_TAG: u8 = 0x7e;
 const TEN_HOURS: time::Duration = time::Duration::hours(10);
 const SEVEN_DAYS: time::Duration = time::Duration::days(7);
+const MAX_REFERRAL_HOPS: usize = 8;
+
+/// Explicit realm-to-KDC mappings permitted during a referral chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferralPolicy {
+    realms: BTreeMap<String, String>,
+    max_hops: usize,
+}
+
+impl Default for ReferralPolicy {
+    fn default() -> Self {
+        Self {
+            realms: BTreeMap::new(),
+            max_hops: MAX_REFERRAL_HOPS,
+        }
+    }
+}
+
+impl ReferralPolicy {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn allow_realm(
+        &mut self,
+        realm: impl Into<String>,
+        endpoint: impl Into<String>,
+    ) -> Result<(), KerberosError> {
+        let realm = realm.into().trim().to_ascii_uppercase();
+        validate_realm(&realm)?;
+        let endpoint = endpoint.into();
+        let normalized = KdcTransportConfig::new(endpoint).endpoint;
+        if normalized.is_empty() {
+            return Err(KerberosError::InvalidEndpoint(normalized));
+        }
+        self.realms.insert(realm, normalized);
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn max_hops(&self) -> usize {
+        self.max_hops
+    }
+
+    pub fn set_max_hops(&mut self, max_hops: usize) -> Result<(), KerberosError> {
+        if !(1..=MAX_REFERRAL_HOPS).contains(&max_hops) {
+            return Err(KerberosError::InvalidMessage(format!(
+                "referral hop limit must be between 1 and {MAX_REFERRAL_HOPS}"
+            )));
+        }
+        self.max_hops = max_hops;
+        Ok(())
+    }
+
+    pub(crate) fn endpoint_for(&self, realm: &str) -> Option<&str> {
+        self.realms
+            .get(&realm.to_ascii_uppercase())
+            .map(String::as_str)
+    }
+}
 
 /// Configuration for a Kerberos KDC client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +110,11 @@ pub struct KerberosClientConfig {
     pub realm: String,
     pub connect_timeout: Duration,
     pub operation_timeout: Duration,
+    pub udp_timeout: Duration,
     pub max_response_size: usize,
+    pub max_udp_response_size: usize,
+    pub transport_policy: KdcTransportPolicy,
+    pub referral_policy: ReferralPolicy,
 }
 
 impl KerberosClientConfig {
@@ -58,7 +125,11 @@ impl KerberosClientConfig {
             realm: realm.into().trim().to_ascii_uppercase(),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             operation_timeout: DEFAULT_OPERATION_TIMEOUT,
+            udp_timeout: DEFAULT_UDP_TIMEOUT,
             max_response_size: DEFAULT_MAX_RESPONSE_SIZE,
+            max_udp_response_size: DEFAULT_MAX_UDP_RESPONSE_SIZE,
+            transport_policy: KdcTransportPolicy::UdpThenTcp,
+            referral_policy: ReferralPolicy::default(),
         }
     }
 }
@@ -153,6 +224,7 @@ pub struct TicketGrantingTicket {
     pub(crate) session_encryption_type: KerberosEncryptionType,
     pub(crate) client_principal: String,
     pub(crate) realm: String,
+    pub(crate) kdc_realm: String,
     pub(crate) issued_at_unix: i64,
     pub(crate) valid_from_unix: i64,
     pub(crate) valid_until_unix: i64,
@@ -166,6 +238,7 @@ impl core::fmt::Debug for TicketGrantingTicket {
             .debug_struct("TicketGrantingTicket")
             .field("client_principal", &self.client_principal)
             .field("realm", &self.realm)
+            .field("kdc_realm", &self.kdc_realm)
             .field("session_encryption_type", &self.session_encryption_type)
             .field("issued_at_unix", &self.issued_at_unix)
             .field("valid_from_unix", &self.valid_from_unix)
@@ -185,6 +258,13 @@ impl TicketGrantingTicket {
     #[must_use]
     pub fn realm(&self) -> &str {
         &self.realm
+    }
+
+    /// Realm whose KDC can consume this TGT. For a home-realm TGT this is the
+    /// client realm; for a referral TGT it is the referred realm.
+    #[must_use]
+    pub fn kdc_realm(&self) -> &str {
+        &self.kdc_realm
     }
 
     #[must_use]
@@ -231,7 +311,10 @@ impl KerberosClient {
         let mut transport_config = KdcTransportConfig::new(config.endpoint.clone());
         transport_config.connect_timeout = config.connect_timeout;
         transport_config.operation_timeout = config.operation_timeout;
+        transport_config.udp_timeout = config.udp_timeout;
         transport_config.max_response_size = config.max_response_size;
+        transport_config.max_udp_response_size = config.max_udp_response_size;
+        transport_config.policy = config.transport_policy;
         let transport = KdcTransport::new(transport_config)?;
         Ok(Self { config, transport })
     }
@@ -613,6 +696,7 @@ fn finish_as_exchange(
         session_encryption_type,
         client_principal: reply_principal,
         realm: reply_realm,
+        kdc_realm: service_realm,
         issued_at_unix,
         valid_from_unix,
         valid_until_unix,
@@ -767,7 +851,7 @@ pub(crate) fn encode_der<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, Kerb
     picky_asn1_der::to_vec(value).map_err(|error| KerberosError::InvalidMessage(error.to_string()))
 }
 
-fn validate_realm(realm: &str) -> Result<(), KerberosError> {
+pub(crate) fn validate_realm(realm: &str) -> Result<(), KerberosError> {
     if realm.is_empty()
         || realm.len() > 255
         || !realm.is_ascii()

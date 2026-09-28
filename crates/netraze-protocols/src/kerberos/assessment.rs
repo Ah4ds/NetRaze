@@ -35,7 +35,8 @@ use time::OffsetDateTime;
 use super::client::{
     AsExchangeReply, build_as_req, decode_enc_kdc_rep_part, decode_kdc_reply, encode_der,
     encrypted_data_type, integer_as_i32, integer_as_u32, integer_i32, integer_u32, kdc_error,
-    kerberos_string, principal, principal_name, validate_der_envelope, validate_username,
+    kerberos_string, principal, principal_name, validate_der_envelope, validate_realm,
+    validate_username,
 };
 use super::crypto::keyed_checksum;
 use super::{
@@ -259,6 +260,7 @@ pub struct ServiceTicket {
     pub(crate) session_key: Vec<u8>,
     pub(crate) session_encryption_type: KerberosEncryptionType,
     pub(crate) client_principal: String,
+    pub(crate) client_realm: String,
     pub(crate) service_principal_name: String,
     pub(crate) realm: String,
     pub(crate) issued_at_unix: i64,
@@ -274,6 +276,7 @@ impl core::fmt::Debug for ServiceTicket {
             .debug_struct("ServiceTicket")
             .field("service_principal_name", &self.service_principal_name)
             .field("client_principal", &self.client_principal)
+            .field("client_realm", &self.client_realm)
             .field("realm", &self.realm)
             .field("session_encryption_type", &self.session_encryption_type)
             .field("valid_until_unix", &self.valid_until_unix)
@@ -399,34 +402,105 @@ impl KerberosClient {
         tgt: &TicketGrantingTicket,
         service_principal_name: &str,
     ) -> Result<ServiceTicket, KerberosError> {
-        let mut rng = OsRng;
-        self.request_service_ticket_at(
-            tgt,
-            service_principal_name,
-            OffsetDateTime::now_utc(),
-            &mut rng,
-        )
-        .await
+        self.request_service_ticket_in_realm(tgt, service_principal_name, &self.config.realm)
+            .await
     }
 
-    async fn request_service_ticket_at<R: RngCore + CryptoRng>(
+    /// Request a service ticket while following only explicitly allowlisted
+    /// KDC referrals. Every referred realm must have an endpoint in the
+    /// client's [`super::ReferralPolicy`].
+    pub async fn request_service_ticket_in_realm(
         &self,
         tgt: &TicketGrantingTicket,
         service_principal_name: &str,
-        now: OffsetDateTime,
-        rng: &mut R,
+        target_realm: &str,
     ) -> Result<ServiceTicket, KerberosError> {
         validate_spn(service_principal_name)?;
-        if !tgt.realm().eq_ignore_ascii_case(&self.config.realm) {
+        let target_realm = target_realm.trim().to_ascii_uppercase();
+        validate_realm(&target_realm)?;
+        if !tgt.kdc_realm().eq_ignore_ascii_case(&self.config.realm) {
+            return Err(KerberosError::InvalidMessage(format!(
+                "TGT is for KDC realm {}, but the client is connected to {}",
+                tgt.kdc_realm(),
+                self.config.realm
+            )));
+        }
+        if !target_realm.eq_ignore_ascii_case(&self.config.realm)
+            && self
+                .config
+                .referral_policy
+                .endpoint_for(&target_realm)
+                .is_none()
+        {
+            return Err(KerberosError::ReferralDenied {
+                realm: target_realm,
+            });
+        }
+
+        let mut current_client = self.clone();
+        let mut current_tgt = tgt.clone();
+        let mut visited = HashSet::from([self.config.realm.to_ascii_uppercase()]);
+        for hop in 0..=self.config.referral_policy.max_hops() {
+            let mut rng = OsRng;
+            let outcome = current_client
+                .request_tgs_outcome_at(
+                    &current_tgt,
+                    service_principal_name,
+                    &target_realm,
+                    OffsetDateTime::now_utc(),
+                    &mut rng,
+                )
+                .await?;
+            match outcome {
+                TgsExchangeTicket::Service(ticket) => return Ok(ticket),
+                TgsExchangeTicket::Referral(referral) => {
+                    if hop == self.config.referral_policy.max_hops() {
+                        return Err(KerberosError::ReferralLimit {
+                            limit: self.config.referral_policy.max_hops(),
+                        });
+                    }
+                    let next_realm = referral.kdc_realm().to_ascii_uppercase();
+                    if !visited.insert(next_realm.clone()) {
+                        return Err(KerberosError::ReferralLoop { realm: next_realm });
+                    }
+                    let endpoint = self
+                        .config
+                        .referral_policy
+                        .endpoint_for(&next_realm)
+                        .ok_or_else(|| KerberosError::ReferralDenied {
+                            realm: next_realm.clone(),
+                        })?;
+                    let mut config = current_client.config.clone();
+                    config.endpoint = endpoint.to_owned();
+                    config.realm = next_realm;
+                    current_client = KerberosClient::connect(config)?;
+                    current_tgt = referral;
+                }
+            }
+        }
+        Err(KerberosError::ReferralLimit {
+            limit: self.config.referral_policy.max_hops(),
+        })
+    }
+
+    async fn request_tgs_outcome_at<R: RngCore + CryptoRng>(
+        &self,
+        tgt: &TicketGrantingTicket,
+        service_principal_name: &str,
+        target_realm: &str,
+        now: OffsetDateTime,
+        rng: &mut R,
+    ) -> Result<TgsExchangeTicket, KerberosError> {
+        if !tgt.kdc_realm().eq_ignore_ascii_case(&self.config.realm) {
             return Err(KerberosError::InvalidMessage(
-                "TGT realm does not match the configured KDC realm".to_owned(),
+                "TGT KDC realm does not match the configured KDC realm".to_owned(),
             ));
         }
         let nonce = rng.r#gen::<u32>() & 0x7fff_ffff;
-        let request = build_tgs_req(tgt, service_principal_name, nonce, now, rng)?;
+        let request = build_tgs_req(tgt, service_principal_name, target_realm, nonce, now, rng)?;
         let response = self.transport.exchange(&encode_der(&request)?).await?;
         let reply = decode_tgs_reply(&response)?;
-        finish_tgs_exchange(reply, tgt, service_principal_name, nonce)
+        finish_tgs_exchange_or_referral(reply, tgt, service_principal_name, target_realm, nonce)
     }
 
     pub async fn assess_as_rep(
@@ -489,6 +563,7 @@ impl KerberosClient {
 fn build_tgs_req<R: RngCore + CryptoRng>(
     tgt: &TicketGrantingTicket,
     spn: &str,
+    request_realm: &str,
     nonce: u32,
     now: OffsetDateTime,
     rng: &mut R,
@@ -500,7 +575,7 @@ fn build_tgs_req<R: RngCore + CryptoRng>(
             0x40, 0x81, 0x00, 0x00,
         ]))),
         cname: Optional::from(None),
-        realm: ExplicitContextTag2::from(kerberos_string(tgt.realm())?),
+        realm: ExplicitContextTag2::from(kerberos_string(request_realm)?),
         sname: Optional::from(Some(ExplicitContextTag3::from(service_name))),
         from: Optional::from(None),
         till: ExplicitContextTag5::from(GeneralizedTimeAsn1::from(GeneralizedTime::from(
@@ -587,12 +662,18 @@ fn decode_tgs_reply(bytes: &[u8]) -> Result<TgsRep, KerberosError> {
     }
 }
 
-fn finish_tgs_exchange(
+enum TgsExchangeTicket {
+    Service(ServiceTicket),
+    Referral(TicketGrantingTicket),
+}
+
+fn finish_tgs_exchange_or_referral(
     reply: TgsRep,
     tgt: &TicketGrantingTicket,
     requested_spn: &str,
+    requested_realm: &str,
     nonce: u32,
-) -> Result<ServiceTicket, KerberosError> {
+) -> Result<TgsExchangeTicket, KerberosError> {
     if integer_as_i32(&reply.0.msg_type.0) != Some(13)
         || !reply
             .0
@@ -620,26 +701,20 @@ fn finish_tgs_exchange(
         &reply.0.enc_part.0.cipher.0.0,
     )?;
     let encrypted_part = decode_enc_kdc_rep_part(&plaintext)?;
-    if integer_as_u32(&encrypted_part.nonce.0) != Some(nonce)
-        || !encrypted_part
-            .srealm
-            .0
-            .0
-            .to_string()
-            .eq_ignore_ascii_case(tgt.realm())
-        || !principal_name(&encrypted_part.sname.0).eq_ignore_ascii_case(requested_spn)
-    {
+    if integer_as_u32(&encrypted_part.nonce.0) != Some(nonce) {
         return Err(KerberosError::InvalidMessage(
-            "TGS-REP service or nonce does not match the request".to_owned(),
+            "TGS-REP nonce does not match the request".to_owned(),
         ));
     }
+    let reply_service = principal_name(&encrypted_part.sname.0);
+    let reply_service_realm = encrypted_part.srealm.0.0.to_string();
     let ticket_spn = principal_name(&reply.0.ticket.0.0.sname.0);
     let ticket_realm = reply.0.ticket.0.0.realm.0.0.to_string();
-    if !ticket_spn.eq_ignore_ascii_case(requested_spn)
-        || !ticket_realm.eq_ignore_ascii_case(tgt.realm())
+    if !ticket_spn.eq_ignore_ascii_case(&reply_service)
+        || !ticket_realm.eq_ignore_ascii_case(&reply_service_realm)
     {
         return Err(KerberosError::InvalidMessage(
-            "service ticket identity does not match the request".to_owned(),
+            "TGS-REP encrypted service identity does not match its ticket".to_owned(),
         ));
     }
     let session_encryption_type = KerberosEncryptionType::from_number(
@@ -680,19 +755,70 @@ fn finish_tgs_exchange(
         })
         .transpose()?;
     let ticket_flags = super::client::kerberos_flags_as_u32(&encrypted_part.flags.0)?;
-    Ok(ServiceTicket {
+    let service_ticket = ServiceTicket {
         ticket: reply.0.ticket.0,
         session_key,
         session_encryption_type,
         client_principal: tgt.client_principal.clone(),
-        service_principal_name: ticket_spn,
-        realm: ticket_realm,
+        client_realm: tgt.realm.clone(),
+        service_principal_name: ticket_spn.clone(),
+        realm: ticket_realm.clone(),
         issued_at_unix,
         valid_from_unix,
         valid_until_unix,
         renewable_until_unix,
         ticket_flags,
-    })
+    };
+    if ticket_spn.eq_ignore_ascii_case(requested_spn)
+        && ticket_realm.eq_ignore_ascii_case(requested_realm)
+    {
+        return Ok(TgsExchangeTicket::Service(service_ticket));
+    }
+    let mut components = ticket_spn.split('/');
+    if components
+        .next()
+        .is_some_and(|component| component.eq_ignore_ascii_case("krbtgt"))
+    {
+        let next_realm = components.next().ok_or_else(|| {
+            KerberosError::InvalidMessage("referral TGT has no target realm".to_owned())
+        })?;
+        if components.next().is_some() {
+            return Err(KerberosError::InvalidMessage(
+                "referral TGT service principal has too many components".to_owned(),
+            ));
+        }
+        return Ok(TgsExchangeTicket::Referral(TicketGrantingTicket {
+            ticket: service_ticket.ticket,
+            session_key: service_ticket.session_key,
+            session_encryption_type: service_ticket.session_encryption_type,
+            client_principal: service_ticket.client_principal,
+            realm: service_ticket.client_realm,
+            kdc_realm: next_realm.to_ascii_uppercase(),
+            issued_at_unix: service_ticket.issued_at_unix,
+            valid_from_unix: service_ticket.valid_from_unix,
+            valid_until_unix: service_ticket.valid_until_unix,
+            renewable_until_unix: service_ticket.renewable_until_unix,
+            ticket_flags: service_ticket.ticket_flags,
+        }));
+    }
+    Err(KerberosError::InvalidMessage(format!(
+        "TGS-REP returned {ticket_spn}@{ticket_realm}, expected {requested_spn}@{requested_realm} or a referral TGT"
+    )))
+}
+
+#[cfg(test)]
+fn finish_tgs_exchange(
+    reply: TgsRep,
+    tgt: &TicketGrantingTicket,
+    requested_spn: &str,
+    nonce: u32,
+) -> Result<ServiceTicket, KerberosError> {
+    match finish_tgs_exchange_or_referral(reply, tgt, requested_spn, tgt.kdc_realm(), nonce)? {
+        TgsExchangeTicket::Service(ticket) => Ok(ticket),
+        TgsExchangeTicket::Referral(_) => Err(KerberosError::InvalidMessage(
+            "test exchange unexpectedly returned a referral".to_owned(),
+        )),
+    }
 }
 
 fn format_as_rep_artifact(
@@ -954,8 +1080,15 @@ mod tests {
     fn tgs_request_carries_decryptable_ap_req_authenticator() {
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let tgt = test_tgt(now);
-        let request =
-            build_tgs_req(&tgt, "HTTP/web.example.test", 0x1020_3040, now, &mut OsRng).unwrap();
+        let request = build_tgs_req(
+            &tgt,
+            "HTTP/web.example.test",
+            "EXAMPLE.TEST",
+            0x1020_3040,
+            now,
+            &mut OsRng,
+        )
+        .unwrap();
         let encoded = encode_der(&request).unwrap();
         let decoded: TgsReq = picky_asn1_der::from_bytes(&encoded).unwrap();
         assert_eq!(
@@ -1054,6 +1187,99 @@ mod tests {
         );
     }
 
+    #[test]
+    fn validates_referral_tgt_and_preserves_original_client_realm() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let tgt = test_tgt(now);
+        let nonce = 0x5566_7788;
+        let referral_name = principal(NT_SRV_INST, &["krbtgt", "CHILD.TEST"]).unwrap();
+        let reply_part = EncTgsRepPart::from(EncKdcRepPart {
+            key: ExplicitContextTag0::from(EncryptionKey {
+                key_type: ExplicitContextTag0::from(integer_i32(18)),
+                key_value: ExplicitContextTag1::from(OctetStringAsn1::from(vec![0x44; 32])),
+            }),
+            last_req: ExplicitContextTag1::from(LastReq::from(Vec::new())),
+            nonce: ExplicitContextTag2::from(integer_u32(nonce)),
+            key_expiration: Optional::from(None),
+            flags: ExplicitContextTag4::from(KerberosFlags::from(BitString::with_bytes(vec![
+                0x40, 0, 0, 0,
+            ]))),
+            auth_time: ExplicitContextTag5::from(GeneralizedTimeAsn1::from(GeneralizedTime::from(
+                now,
+            ))),
+            start_time: Optional::from(None),
+            end_time: ExplicitContextTag7::from(GeneralizedTimeAsn1::from(GeneralizedTime::from(
+                now + time::Duration::hours(10),
+            ))),
+            renew_till: Optional::from(None),
+            srealm: ExplicitContextTag9::from(kerberos_string("EXAMPLE.TEST").unwrap()),
+            sname: ExplicitContextTag10::from(referral_name.clone()),
+            caadr: Optional::from(None),
+            encrypted_pa_data: Optional::from(None),
+        });
+        let encrypted_reply = encrypt(
+            KerberosEncryptionType::Rc4Hmac,
+            &tgt.session_key,
+            TGS_REP_ENC_SESSION_KEY,
+            &encode_der(&reply_part).unwrap(),
+            &mut OsRng,
+        )
+        .unwrap();
+        let referral_ticket = Ticket::from(TicketInner {
+            tkt_vno: ExplicitContextTag0::from(integer_i32(5)),
+            realm: ExplicitContextTag1::from(kerberos_string("EXAMPLE.TEST").unwrap()),
+            sname: ExplicitContextTag2::from(referral_name),
+            enc_part: ExplicitContextTag3::from(EncryptedData {
+                etype: ExplicitContextTag0::from(integer_i32(18)),
+                kvno: Optional::from(None),
+                cipher: ExplicitContextTag2::from(OctetStringAsn1::from(vec![0x33; 48])),
+            }),
+        });
+        let reply = TgsRep::from(KdcRep {
+            pvno: ExplicitContextTag0::from(integer_i32(5)),
+            msg_type: ExplicitContextTag1::from(integer_i32(13)),
+            padata: Optional::from(None),
+            crealm: ExplicitContextTag3::from(kerberos_string("EXAMPLE.TEST").unwrap()),
+            cname: ExplicitContextTag4::from(principal(NT_PRINCIPAL, &["alice"]).unwrap()),
+            ticket: ExplicitContextTag5::from(referral_ticket),
+            enc_part: picky_asn1::wrapper::ExplicitContextTag6::from(EncryptedData {
+                etype: ExplicitContextTag0::from(integer_i32(23)),
+                kvno: Optional::from(None),
+                cipher: ExplicitContextTag2::from(OctetStringAsn1::from(encrypted_reply)),
+            }),
+        });
+        let outcome = finish_tgs_exchange_or_referral(
+            reply,
+            &tgt,
+            "ldap/dc01.child.test",
+            "CHILD.TEST",
+            nonce,
+        )
+        .unwrap();
+        let TgsExchangeTicket::Referral(referral) = outcome else {
+            panic!("expected a referral TGT");
+        };
+        assert_eq!(referral.realm(), "EXAMPLE.TEST");
+        assert_eq!(referral.kdc_realm(), "CHILD.TEST");
+    }
+
+    #[tokio::test]
+    async fn cross_realm_request_is_rejected_before_network_without_allowlist() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let tgt = test_tgt(now);
+        let mut config = super::super::KerberosClientConfig::new("127.0.0.1:9", "EXAMPLE.TEST");
+        config.transport_policy = super::super::KdcTransportPolicy::TcpOnly;
+        let client = KerberosClient::connect(config).unwrap();
+        let error = client
+            .request_service_ticket_in_realm(&tgt, "ldap/dc01.child.test", "CHILD.TEST")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            KerberosError::ReferralDenied { ref realm } if realm == "CHILD.TEST"
+        ));
+    }
+
     fn ticket_with_cipher(encryption_type: i32, cipher: Vec<u8>) -> Ticket {
         Ticket::from(TicketInner {
             tkt_vno: ExplicitContextTag0::from(integer_i32(5)),
@@ -1085,6 +1311,7 @@ mod tests {
             session_encryption_type: KerberosEncryptionType::Rc4Hmac,
             client_principal: "alice".to_owned(),
             realm: "EXAMPLE.TEST".to_owned(),
+            kdc_realm: "EXAMPLE.TEST".to_owned(),
             issued_at_unix: now.unix_timestamp(),
             valid_from_unix: now.unix_timestamp(),
             valid_until_unix: (now + time::Duration::hours(10)).unix_timestamp(),

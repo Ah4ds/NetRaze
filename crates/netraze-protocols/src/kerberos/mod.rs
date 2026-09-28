@@ -18,7 +18,7 @@ pub use ticket::{
     KerberosTicket, KerberosTicketKind, TicketCache, TicketFileFormat, TicketMetadata,
     TicketSelector, export_ticket_file, import_ticket_file,
 };
-pub use transport::{KdcTransport, KdcTransportConfig};
+pub use transport::{KdcTransport, KdcTransportConfig, KdcTransportPolicy};
 
 use netraze_core::Capability;
 
@@ -41,4 +41,6 @@ pub use assessment::{
     KerberosAssessmentOutcome, KerberosAssessmentTargets, RoastArtifact, ServicePrincipalTarget,
     ServiceTicket, export_roast_artifacts, targets_from_inventory,
 };
-pub use client::{KerberosClient, KerberosClientConfig, KerberosCredential, TicketGrantingTicket};
+pub use client::{
+    KerberosClient, KerberosClientConfig, KerberosCredential, ReferralPolicy, TicketGrantingTicket,
+};

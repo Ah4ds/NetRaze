@@ -25,6 +25,14 @@ pub enum KerberosError {
     TicketNotFound,
     #[error("multiple Kerberos tickets matched the requested selector")]
     AmbiguousTicket,
+    #[error("Kerberos referral to realm {realm} is not allowlisted")]
+    ReferralDenied { realm: String },
+    #[error("Kerberos referral realm {realm} has no configured KDC endpoint")]
+    MissingReferralEndpoint { realm: String },
+    #[error("Kerberos referral loop detected at realm {realm}")]
+    ReferralLoop { realm: String },
+    #[error("Kerberos referral chain exceeded the {limit}-hop limit")]
+    ReferralLimit { limit: usize },
     #[error("Kerberos TCP frame announced an empty payload")]
     EmptyFrame,
     #[error("Kerberos TCP response is {announced} bytes; limit is {limit} bytes")]
