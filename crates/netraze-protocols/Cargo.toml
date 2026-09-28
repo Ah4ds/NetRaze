@@ -30,6 +30,7 @@ hmac = { workspace = true }
 log = { workspace = true }
 md-5 = { workspace = true }
 md4 = { workspace = true }
+ms-pac-forge = { workspace = true }
 rand = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }

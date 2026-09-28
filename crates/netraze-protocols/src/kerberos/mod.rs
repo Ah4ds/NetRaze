@@ -7,6 +7,7 @@
 
 mod assessment;
 mod client;
+mod construction;
 mod crypto;
 mod error;
 mod gss;
@@ -14,10 +15,15 @@ mod s4u;
 mod ticket;
 mod transport;
 
+pub use construction::{
+    TicketConstructionIdentity, TicketConstructionKey, TicketConstructionLifetime,
+    TicketConstructionOptions, forge_diamond_ticket, forge_golden_ticket, forge_sapphire_ticket,
+    forge_silver_ticket,
+};
 pub use crypto::{KerberosEncryptionType, decrypt, derive_password_key, encrypt};
 pub use error::KerberosError;
 pub use gss::{KerberosGssInitiator, KerberosSecurityContext};
-pub use s4u::{S4uDelegationMode, S4uEvidenceTicket};
+pub use s4u::{S4uDelegationMode, S4uEvidenceTicket, SapphirePacEvidence};
 pub use ticket::{
     KerberosTicket, KerberosTicketKind, TicketCache, TicketFileFormat, TicketMetadata,
     TicketSelector, export_ticket_file, import_ticket_file,

