@@ -9,10 +9,15 @@ mod assessment;
 mod client;
 mod crypto;
 mod error;
+mod ticket;
 mod transport;
 
 pub use crypto::{KerberosEncryptionType, decrypt, derive_password_key, encrypt};
 pub use error::KerberosError;
+pub use ticket::{
+    KerberosTicket, KerberosTicketKind, TicketCache, TicketFileFormat, TicketMetadata,
+    TicketSelector, export_ticket_file, import_ticket_file,
+};
 pub use transport::{KdcTransport, KdcTransportConfig};
 
 use netraze_core::Capability;

@@ -23,6 +23,7 @@ rusthound-ce = { workspace = true }
 # See crates/netraze-protocols/src/smb/crypto.rs for the consumers.
 aes = { workspace = true }
 cbc = { workspace = true }
+ccache-io = { workspace = true }
 cipher = { workspace = true }
 des = { workspace = true }
 hmac = { workspace = true }

@@ -29,6 +29,7 @@ aes = "0.8"
 anyhow = "1.0"
 async-trait = "0.1"
 cbc = "0.1"
+ccache-io = "0.1.0"
 cipher = { version = "0.4", features = ["block-padding"] }
 clap = { version = "4.5", features = ["derive"] }
 des = "0.8"

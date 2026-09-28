@@ -153,9 +153,11 @@ pub struct TicketGrantingTicket {
     pub(crate) session_encryption_type: KerberosEncryptionType,
     pub(crate) client_principal: String,
     pub(crate) realm: String,
+    pub(crate) issued_at_unix: i64,
     pub(crate) valid_from_unix: i64,
     pub(crate) valid_until_unix: i64,
     pub(crate) renewable_until_unix: Option<i64>,
+    pub(crate) ticket_flags: u32,
 }
 
 impl core::fmt::Debug for TicketGrantingTicket {
@@ -165,9 +167,11 @@ impl core::fmt::Debug for TicketGrantingTicket {
             .field("client_principal", &self.client_principal)
             .field("realm", &self.realm)
             .field("session_encryption_type", &self.session_encryption_type)
+            .field("issued_at_unix", &self.issued_at_unix)
             .field("valid_from_unix", &self.valid_from_unix)
             .field("valid_until_unix", &self.valid_until_unix)
             .field("renewable_until_unix", &self.renewable_until_unix)
+            .field("ticket_flags", &format_args!("{:#010x}", self.ticket_flags))
             .finish_non_exhaustive()
     }
 }
@@ -191,6 +195,16 @@ impl TicketGrantingTicket {
     #[must_use]
     pub const fn valid_from_unix(&self) -> i64 {
         self.valid_from_unix
+    }
+
+    #[must_use]
+    pub const fn issued_at_unix(&self) -> i64 {
+        self.issued_at_unix
+    }
+
+    #[must_use]
+    pub const fn ticket_flags(&self) -> u32 {
+        self.ticket_flags
     }
 
     #[must_use]
@@ -578,6 +592,7 @@ fn finish_as_exchange(
         || encrypted_part.auth_time.0.clone(),
         |value| value.0.clone(),
     );
+    let issued_at_unix = date_to_unix(encrypted_part.auth_time.0.clone())?;
     let valid_from_unix = date_to_unix(valid_from)?;
     let valid_until_unix = date_to_unix(encrypted_part.end_time.0.clone())?;
     if valid_until_unix <= valid_from_unix {
@@ -591,16 +606,31 @@ fn finish_as_exchange(
         .as_ref()
         .map(|value| date_to_unix(value.0.clone()))
         .transpose()?;
+    let ticket_flags = kerberos_flags_as_u32(&encrypted_part.flags.0)?;
     Ok(TicketGrantingTicket {
         ticket: as_rep.0.ticket.0,
         session_key,
         session_encryption_type,
         client_principal: reply_principal,
         realm: reply_realm,
+        issued_at_unix,
         valid_from_unix,
         valid_until_unix,
         renewable_until_unix,
+        ticket_flags,
     })
+}
+
+pub(crate) fn kerberos_flags_as_u32(
+    flags: &picky_krb::data_types::KerberosFlags,
+) -> Result<u32, KerberosError> {
+    let bytes = flags.0.as_bytes();
+    if bytes.len() != 5 || bytes[0] != 0 {
+        return Err(KerberosError::InvalidMessage(
+            "Kerberos ticket flags are not a 32-bit bit string".to_owned(),
+        ));
+    }
+    Ok(u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]))
 }
 
 /// Windows-compatible KDCs may encode an AS reply's encrypted body with the

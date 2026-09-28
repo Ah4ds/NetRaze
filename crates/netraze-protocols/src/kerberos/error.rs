@@ -15,6 +15,16 @@ pub enum KerberosError {
         #[source]
         source: io::Error,
     },
+    #[error("Kerberos ticket file {path} exceeds the {limit}-byte limit")]
+    TicketFileTooLarge { path: String, limit: usize },
+    #[error("Kerberos ticket file already exists: {0}")]
+    TicketFileExists(String),
+    #[error("invalid Kerberos ticket container: {0}")]
+    InvalidTicketContainer(String),
+    #[error("no Kerberos ticket matched the requested selector")]
+    TicketNotFound,
+    #[error("multiple Kerberos tickets matched the requested selector")]
+    AmbiguousTicket,
     #[error("Kerberos TCP frame announced an empty payload")]
     EmptyFrame,
     #[error("Kerberos TCP response is {announced} bytes; limit is {limit} bytes")]

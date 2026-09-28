@@ -255,12 +255,17 @@ impl KerberosAssessmentOutcome {
 /// private and are never serialized by NetRaze.
 #[derive(Clone)]
 pub struct ServiceTicket {
-    ticket: Ticket,
-    _session_key: Vec<u8>,
-    session_encryption_type: KerberosEncryptionType,
-    service_principal_name: String,
-    realm: String,
-    valid_until_unix: i64,
+    pub(crate) ticket: Ticket,
+    pub(crate) session_key: Vec<u8>,
+    pub(crate) session_encryption_type: KerberosEncryptionType,
+    pub(crate) client_principal: String,
+    pub(crate) service_principal_name: String,
+    pub(crate) realm: String,
+    pub(crate) issued_at_unix: i64,
+    pub(crate) valid_from_unix: i64,
+    pub(crate) valid_until_unix: i64,
+    pub(crate) renewable_until_unix: Option<i64>,
+    pub(crate) ticket_flags: u32,
 }
 
 impl core::fmt::Debug for ServiceTicket {
@@ -268,9 +273,11 @@ impl core::fmt::Debug for ServiceTicket {
         formatter
             .debug_struct("ServiceTicket")
             .field("service_principal_name", &self.service_principal_name)
+            .field("client_principal", &self.client_principal)
             .field("realm", &self.realm)
             .field("session_encryption_type", &self.session_encryption_type)
             .field("valid_until_unix", &self.valid_until_unix)
+            .field("ticket_flags", &format_args!("{:#010x}", self.ticket_flags))
             .finish_non_exhaustive()
     }
 }
@@ -294,6 +301,31 @@ impl ServiceTicket {
     #[must_use]
     pub const fn valid_until_unix(&self) -> i64 {
         self.valid_until_unix
+    }
+
+    #[must_use]
+    pub fn client_principal(&self) -> &str {
+        &self.client_principal
+    }
+
+    #[must_use]
+    pub const fn valid_from_unix(&self) -> i64 {
+        self.valid_from_unix
+    }
+
+    #[must_use]
+    pub const fn issued_at_unix(&self) -> i64 {
+        self.issued_at_unix
+    }
+
+    #[must_use]
+    pub const fn renewable_until_unix(&self) -> Option<i64> {
+        self.renewable_until_unix
+    }
+
+    #[must_use]
+    pub const fn ticket_flags(&self) -> u32 {
+        self.ticket_flags
     }
 
     pub fn roast_artifact(&self, account: &str) -> Result<RoastArtifact, KerberosError> {
@@ -623,16 +655,43 @@ fn finish_tgs_exchange(
             actual: session_key.len(),
         });
     }
-    let valid_until = OffsetDateTime::try_from(encrypted_part.end_time.0.0.clone())
+    let issued_at_unix = OffsetDateTime::try_from(encrypted_part.auth_time.0.0.clone())
         .map_err(|error| KerberosError::InvalidMessage(error.to_string()))?
         .unix_timestamp();
+    let valid_from_unix = encrypted_part.start_time.0.as_ref().map_or_else(
+        || Ok(issued_at_unix),
+        |value| {
+            OffsetDateTime::try_from(value.0.0.clone())
+                .map(|date| date.unix_timestamp())
+                .map_err(|error| KerberosError::InvalidMessage(error.to_string()))
+        },
+    )?;
+    let valid_until_unix = OffsetDateTime::try_from(encrypted_part.end_time.0.0.clone())
+        .map_err(|error| KerberosError::InvalidMessage(error.to_string()))?
+        .unix_timestamp();
+    let renewable_until_unix = encrypted_part
+        .renew_till
+        .0
+        .as_ref()
+        .map(|value| {
+            OffsetDateTime::try_from(value.0.0.clone())
+                .map(|date| date.unix_timestamp())
+                .map_err(|error| KerberosError::InvalidMessage(error.to_string()))
+        })
+        .transpose()?;
+    let ticket_flags = super::client::kerberos_flags_as_u32(&encrypted_part.flags.0)?;
     Ok(ServiceTicket {
         ticket: reply.0.ticket.0,
-        _session_key: session_key,
+        session_key,
         session_encryption_type,
+        client_principal: tgt.client_principal.clone(),
         service_principal_name: ticket_spn,
         realm: ticket_realm,
-        valid_until_unix: valid_until,
+        issued_at_unix,
+        valid_from_unix,
+        valid_until_unix,
+        renewable_until_unix,
+        ticket_flags,
     })
 }
 
@@ -1026,9 +1085,11 @@ mod tests {
             session_encryption_type: KerberosEncryptionType::Rc4Hmac,
             client_principal: "alice".to_owned(),
             realm: "EXAMPLE.TEST".to_owned(),
+            issued_at_unix: now.unix_timestamp(),
             valid_from_unix: now.unix_timestamp(),
             valid_until_unix: (now + time::Duration::hours(10)).unix_timestamp(),
             renewable_until_unix: None,
+            ticket_flags: 0,
         }
     }
 }
